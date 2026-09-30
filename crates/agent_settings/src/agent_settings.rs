@@ -242,6 +242,7 @@ pub struct AgentSettings {
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
     pub expand_code_block: bool,
+    pub tool_output_preview_lines: usize,
     pub terminal_init_command: Option<String>,
     pub thinking_display: ThinkingBlockDisplay,
     pub cancel_generation_on_terminal_stop: bool,
@@ -837,6 +838,7 @@ impl Settings for AgentSettings {
             expand_edit_card: agent.expand_edit_card.unwrap(),
             expand_terminal_card: agent.expand_terminal_card.unwrap(),
             expand_code_block: agent.expand_code_block.unwrap(),
+            tool_output_preview_lines: agent.tool_output_preview_lines.unwrap(),
             terminal_init_command: agent
                 .terminal_init_command
                 .filter(|command| !command.trim().is_empty()),

@@ -23,12 +23,14 @@ use editor::actions::OpenExcerpts;
 use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
+use crate::entry_view_state::terminal_line_limit;
 use crate::message_editor::SharedSessionCapabilities;
 use crate::ui::{
     SandboxGroup, SandboxRow, SandboxSection, SandboxStatusTooltip, TerminalSandboxWarning,
     TerminalToolHeader,
 };
 use crate::unicode_confusables;
+use terminal_view::TerminalView;
 
 use db::kvp::KeyValueStore;
 use gpui::List;
@@ -561,6 +563,13 @@ impl PermissionSelection {
             }
         }
     }
+}
+
+struct ToolOutputPreview {
+    preview_lines: usize,
+    total_lines: usize,
+    fully_shown: bool,
+    clamped: bool,
 }
 
 pub struct ThreadView {
@@ -8150,6 +8159,13 @@ impl ThreadView {
             .overflow_hidden()
             .child(header)
             .when(is_expanded && terminal_view.is_some(), |this| {
+                let preview_toggle = self.render_terminal_preview_toggle(
+                    terminal,
+                    terminal_view.as_ref(),
+                    tool_call,
+                    window,
+                    cx,
+                );
                 this.child(
                     div()
                         .pt_2()
@@ -8180,6 +8196,7 @@ impl ThreadView {
                                 .into_any_element()
                         })),
                 )
+                .children(preview_toggle)
             })
             .when_some(confirmation_options, |this, options| {
                 let is_first = self.is_first_tool_call(active_session_id, &tool_call.id, cx);
@@ -10702,6 +10719,10 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let line_height = markdown_style
+            .base_text_style
+            .line_height_in_pixels(window.rem_size());
+        let preview = self.tool_output_preview(&markdown, tool_call, cx);
         let output = self
             .render_numbered_read_file_output(
                 markdown.clone(),
@@ -10713,8 +10734,14 @@ impl ThreadView {
             )
             .unwrap_or_else(|| {
                 self.render_markdown(markdown, markdown_style, cx)
+                    .collapse_code_blocks(!AgentSettings::get_global(cx).expand_code_block)
                     .into_any()
             });
+        let clamped_height = preview
+            .as_ref()
+            .filter(|preview| preview.clamped)
+            .map(|preview| line_height * preview.preview_lines as f32);
+        let panel_bg = cx.theme().colors().panel_background;
 
         v_flex()
             .gap_2()
@@ -10733,8 +10760,175 @@ impl ThreadView {
             })
             .text_xs()
             .text_color(cx.theme().colors().text_muted)
-            .child(output)
+            .child(
+                div()
+                    .relative()
+                    .when_some(clamped_height, |this, height| {
+                        this.max_h(height)
+                            .overflow_hidden()
+                            .debug_selector(|| "tool-output-preview".into())
+                    })
+                    .child(output)
+                    .when(clamped_height.is_some(), |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .size_full()
+                                .bg(linear_gradient(
+                                    0.,
+                                    linear_color_stop(panel_bg.opacity(0.8), 0.),
+                                    linear_color_stop(panel_bg.opacity(0.), 0.4),
+                                ))
+                                .block_mouse_except_scroll(),
+                        )
+                    }),
+            )
+            .when_some(preview, |this, preview| {
+                this.child(self.render_tool_output_preview_toggle(
+                    format!("tool-output-toggle-{entry_ix}-{context_ix}").into(),
+                    preview.total_lines,
+                    preview.fully_shown,
+                    tool_call.id.clone(),
+                    cx,
+                ))
+            })
             .into_any_element()
+    }
+
+    /// How a tool's markdown output is previewed under `tool_output_preview_lines`: `None`
+    /// when previews are off or the output already fits.
+    fn tool_output_preview(
+        &self,
+        markdown: &Entity<Markdown>,
+        tool_call: &ToolCall,
+        cx: &App,
+    ) -> Option<ToolOutputPreview> {
+        let preview_lines = AgentSettings::get_global(cx).tool_output_preview_lines;
+        if preview_lines == 0 {
+            return None;
+        }
+        let markdown = markdown.read(cx);
+        let total_lines = markdown.source().lines().count();
+        if total_lines <= preview_lines {
+            return None;
+        }
+        let fully_shown = self
+            .entry_view_state
+            .read(cx)
+            .is_tool_output_fully_shown(&tool_call.id);
+        Some(ToolOutputPreview {
+            preview_lines,
+            total_lines,
+            fully_shown,
+            // The active search match may sit in the hidden part.
+            clamped: !fully_shown && !markdown.has_active_search_highlight(),
+        })
+    }
+
+    fn render_tool_output_preview_toggle(
+        &self,
+        id: SharedString,
+        total_lines: usize,
+        fully_shown: bool,
+        tool_call_id: acp_v1::ToolCallId,
+        cx: &Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let (label, selector) = if fully_shown {
+            (SharedString::from("Show less"), "tool-output-show-less")
+        } else {
+            (
+                SharedString::from(format!("Show all {total_lines} lines")),
+                "tool-output-show-all",
+            )
+        };
+        div().debug_selector(move || selector.into()).child(
+            Button::new(id, label)
+                .label_size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.entry_view_state.update(cx, |state, _| {
+                        state.toggle_tool_output_fully_shown(&tool_call_id);
+                    });
+                    this.apply_terminal_preview_limits(cx);
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// "Show all M lines" / "Show less" under a terminal whose output is longer than
+    /// `tool_output_preview_lines`.
+    fn render_terminal_preview_toggle(
+        &self,
+        terminal: &Entity<acp_thread::Terminal>,
+        terminal_view: Option<&Entity<TerminalView>>,
+        tool_call: &ToolCall,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let preview_lines = AgentSettings::get_global(cx).tool_output_preview_lines;
+        if preview_lines == 0 {
+            return None;
+        }
+        let terminal_view = terminal_view?.read(cx);
+        // Over the embedded maximum the terminal is already a fixed-height scroll box.
+        if terminal_view.content_mode(window, cx).is_scrollable() {
+            return None;
+        }
+        // Lines with content; the terminal's total also counts empty rows of its screen.
+        let total_lines = terminal_view.terminal().read(cx).used_lines();
+        if total_lines <= preview_lines {
+            return None;
+        }
+        let fully_shown = self
+            .entry_view_state
+            .read(cx)
+            .is_tool_output_fully_shown(&tool_call.id);
+        Some(
+            div()
+                .px_2()
+                .pb_1()
+                .child(self.render_tool_output_preview_toggle(
+                    format!("terminal-output-toggle-{}", terminal.entity_id()).into(),
+                    total_lines,
+                    fully_shown,
+                    tool_call.id.clone(),
+                    cx,
+                )),
+        )
+    }
+
+    /// Sets every terminal in this thread to show the lines `tool_output_preview_lines` and the
+    /// per-card "show all" choice allow.
+    pub(crate) fn apply_terminal_preview_limits(&self, cx: &mut Context<Self>) {
+        let preview_lines = AgentSettings::get_global(cx).tool_output_preview_lines;
+        let entry_view_state = self.entry_view_state.read(cx);
+        let limits = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_ix, entry)| match entry {
+                AgentThreadEntry::ToolCall(tool_call) => Some((entry_ix, tool_call)),
+                _ => None,
+            })
+            .flat_map(|(entry_ix, tool_call)| {
+                let limit = terminal_line_limit(
+                    preview_lines,
+                    entry_view_state.is_tool_output_fully_shown(&tool_call.id),
+                );
+                tool_call.terminals().filter_map(move |terminal| {
+                    entry_view_state
+                        .entry(entry_ix)?
+                        .terminal(terminal)
+                        .map(|view| (view, limit))
+                })
+            })
+            .collect::<Vec<_>>();
+        for (view, limit) in limits {
+            view.update(cx, |view, cx| view.set_embedded_mode(Some(limit), cx));
+        }
     }
 
     fn render_numbered_read_file_output(

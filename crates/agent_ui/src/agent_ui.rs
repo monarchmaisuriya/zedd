@@ -1002,6 +1002,7 @@ mod tests {
             expand_edit_card: true,
             expand_terminal_card: true,
             expand_code_block: true,
+            tool_output_preview_lines: 0,
             terminal_init_command: None,
             cancel_generation_on_terminal_stop: true,
             use_modifier_to_send: true,
