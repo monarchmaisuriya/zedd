@@ -49,14 +49,14 @@ use crate::{
     NewNativeAgentThreadFromSummary,
 };
 use crate::{
-    AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, LoadThreadFromClipboard,
-    NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown, OpenAgentDiff, RenameSelectedThread,
-    ResetFastModeWarnings, ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata,
-    ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
+    AgentDiffPane, ConversationView, CopyThreadToClipboard, Follow, ForkThread,
+    LoadThreadFromClipboard, NewTerminalThread, NewThread, OpenActiveThreadAsMarkdown,
+    OpenAgentDiff, RenameSelectedThread, ResetFastModeWarnings, ResetTrialUpsell,
+    ShowAllSidebarThreadMetadata, ShowThreadMetadata, ToggleNewThreadMenu, ToggleOptionsMenu,
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, reset_fast_mode_warnings,
     },
-    ui::{AgentNotification, AgentNotificationEvent, EndTrialUpsell},
+    ui::{AgentNotification, AgentNotificationEvent},
 };
 use agent_settings::AgentSettings;
 use ai_onboarding::AgentPanelOnboarding;
@@ -64,8 +64,6 @@ use anyhow::{Context as _, Result, anyhow};
 #[cfg(feature = "audio")]
 use audio::{Audio, Sound};
 use chrono::{DateTime, Utc};
-use client::UserStore;
-use cloud_api_types::Plan;
 use collections::HashMap;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
@@ -481,9 +479,6 @@ pub fn init(cx: &mut App) {
                         });
                     }
                     OnboardingUpsell::set_dismissed(false, cx);
-                })
-                .register_action(|_workspace, _: &ResetTrialEndUpsell, _window, cx| {
-                    TrialEndUpsell::set_dismissed(false, cx);
                 })
                 .register_action(|_workspace, _: &ResetFastModeWarnings, _window, cx| {
                     reset_fast_mode_warnings(cx);
@@ -1103,7 +1098,6 @@ pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     /// Workspace id is used as a database key
     workspace_id: Option<WorkspaceId>,
-    user_store: Entity<UserStore>,
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
     language_registry: Arc<LanguageRegistry>,
@@ -1447,10 +1441,8 @@ impl AgentPanel {
 
     pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
-        let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
         let language_registry = project.read(cx).languages().clone();
-        let client = workspace.client().clone();
         let workspace_id = workspace.database_id();
         let workspace = workspace.weak_handle();
 
@@ -1464,8 +1456,6 @@ impl AgentPanel {
         let weak_panel = cx.entity().downgrade();
         let onboarding = cx.new(|cx| {
             AgentPanelOnboarding::new(
-                user_store.clone(),
-                client,
                 move |_window, cx| {
                     weak_panel
                         .update(cx, |panel, cx| {
@@ -1526,7 +1516,6 @@ impl AgentPanel {
             base_view,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
             workspace,
-            user_store,
             project: project.clone(),
             fs: fs.clone(),
             language_registry,
@@ -1680,6 +1669,7 @@ impl AgentPanel {
                 session_id,
                 work_dirs,
                 title,
+                None,
                 true,
                 AgentThreadSource::AgentPanel,
                 window,
@@ -1688,19 +1678,57 @@ impl AgentPanel {
         }
     }
 
+    /// Opens a session that was just forked from a thread of `agent`. It has no metadata row
+    /// yet, so it is opened by session id with the same agent that produced it.
+    pub fn open_forked_thread(
+        &mut self,
+        agent: Agent,
+        session_id: acp::SessionId,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        draft_prompt: Option<Vec<acp::ContentBlock>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial_content = draft_prompt.map(|blocks| AgentInitialContent::ContentBlock {
+            blocks,
+            auto_submit: false,
+        });
+        self.external_thread_by_session(
+            agent,
+            session_id,
+            work_dirs,
+            title,
+            initial_content,
+            true,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+    }
+
     fn external_thread_by_session(
         &mut self,
         agent: Agent,
         session_id: acp::SessionId,
         work_dirs: Option<PathList>,
         title: Option<SharedString>,
+        initial_content: Option<AgentInitialContent>,
         focus: bool,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let thread = self.create_agent_thread_with_server_for_external_session(
-            agent, None, session_id, work_dirs, title, None, source, window, cx,
+            agent,
+            None,
+            session_id,
+            work_dirs,
+            title,
+            initial_content,
+            source,
+            window,
+            cx,
         );
         self.set_base_view(thread.into(), focus, window, cx);
     }
@@ -3729,6 +3757,16 @@ impl AgentPanel {
         }
     }
 
+    fn fork_active_thread(&mut self, _: &ForkThread, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(conversation_view) = self.active_conversation_view()
+            && let Some(active_thread) = conversation_view.read(cx).active_thread().cloned()
+        {
+            active_thread.update(cx, |thread, cx| {
+                thread.fork(acp_thread::ForkPoint::WholeThread, window, cx)
+            });
+        }
+    }
+
     pub fn open_thread_as_markdown(
         &mut self,
         thread_id: ThreadId,
@@ -5621,6 +5659,13 @@ impl AgentPanel {
             conversation_view.read(cx).has_user_submitted_prompt(cx)
         });
 
+        let can_fork_thread = conversation_view.as_ref().is_some_and(|conversation_view| {
+            conversation_view
+                .read(cx)
+                .active_thread()
+                .is_some_and(|thread_view| thread_view.read(cx).can_fork(cx))
+        });
+
         let has_auth_methods = match &self.base_view {
             BaseView::AgentThread { conversation_view } => {
                 conversation_view.read(cx).has_auth_methods()
@@ -5675,6 +5720,10 @@ impl AgentPanel {
                                             );
                                         }
                                     });
+                                }
+
+                                if can_fork_thread {
+                                    menu = menu.action("Fork Thread", Box::new(ForkThread));
                                 }
 
                                 let root_thread_view =
@@ -6206,32 +6255,6 @@ impl AgentPanel {
             .child(toolbar_content)
     }
 
-    fn should_render_trial_end_upsell(&self, cx: &mut Context<Self>) -> bool {
-        if TrialEndUpsell::dismissed(cx) {
-            return false;
-        }
-
-        match &self.base_view {
-            BaseView::AgentThread { .. } => {
-                if LanguageModelRegistry::global(cx)
-                    .read(cx)
-                    .default_model()
-                    .is_some_and(|model| model.provider_id != language_model::ZED_CLOUD_PROVIDER_ID)
-                {
-                    return false;
-                }
-            }
-            BaseView::Terminal { .. } | BaseView::Uninitialized => {
-                return false;
-            }
-        }
-
-        let plan = self.user_store.read(cx).plan();
-        let has_previous_trial = self.user_store.read(cx).trial_started_at().is_some();
-
-        plan.is_some_and(|plan| plan == Plan::ZedFree) && has_previous_trial
-    }
-
     fn dismiss_ai_onboarding(&mut self, cx: &mut Context<Self>) {
         self.new_user_onboarding_upsell_dismissed
             .store(true, Ordering::Release);
@@ -6247,40 +6270,16 @@ impl AgentPanel {
             return false;
         }
 
-        let user_store = self.user_store.read(cx);
-
-        if user_store.plan().is_some_and(|plan| plan == Plan::ZedPro)
-            && user_store
-                .subscription_period()
-                .and_then(|period| period.0.checked_add_days(chrono::Days::new(1)))
-                .is_some_and(|date| date < chrono::Utc::now())
-        {
-            if !self
-                .new_user_onboarding_upsell_dismissed
-                .load(Ordering::Acquire)
-            {
-                self.dismiss_ai_onboarding(cx);
-            }
-            return false;
-        }
-
-        let has_configured_non_zed_providers = LanguageModelRegistry::read_global(cx)
+        let has_configured_providers = LanguageModelRegistry::read_global(cx)
             .visible_providers()
             .iter()
-            .any(|provider| {
-                provider.is_authenticated(cx)
-                    && provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
-            });
+            .any(|provider| provider.is_authenticated(cx));
 
         match &self.base_view {
             BaseView::Uninitialized | BaseView::Terminal { .. } => false,
             BaseView::AgentThread { conversation_view } => {
-                if conversation_view.read(cx).as_native_thread(cx).is_some() {
-                    let history_is_empty = ThreadStore::global(cx).read(cx).is_empty();
-                    history_is_empty || !has_configured_non_zed_providers
-                } else {
-                    false
-                }
+                conversation_view.read(cx).as_native_thread(cx).is_some()
+                    && !has_configured_providers
             }
         }
     }
@@ -6298,35 +6297,6 @@ impl AgentPanel {
             div()
                 .bg(cx.theme().colors().editor_background)
                 .child(self.new_user_onboarding.clone()),
-        )
-    }
-
-    fn render_trial_end_upsell(
-        &self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        if !self.should_render_trial_end_upsell(cx) {
-            return None;
-        }
-
-        Some(
-            v_flex()
-                .absolute()
-                .inset_0()
-                .size_full()
-                .bg(cx.theme().colors().panel_background)
-                .opacity(0.85)
-                .block_mouse_except_scroll()
-                .child(EndTrialUpsell::new(Arc::new({
-                    let this = cx.entity();
-                    move |_, cx| {
-                        this.update(cx, |_this, cx| {
-                            TrialEndUpsell::set_dismissed(true, cx);
-                            cx.notify();
-                        });
-                    }
-                }))),
         )
     }
 
@@ -6518,6 +6488,7 @@ impl Render for AgentPanel {
                 this.open_configuration(window, cx);
             }))
             .on_action(cx.listener(Self::open_active_thread_as_markdown))
+            .on_action(cx.listener(Self::fork_active_thread))
             .on_action(cx.listener(Self::manage_skills))
             .on_action(cx.listener(Self::toggle_options_menu))
             .on_action(cx.listener(Self::increase_font_size))
@@ -6577,8 +6548,7 @@ impl Render for AgentPanel {
                         .child(terminal_content)
                         .child(self.render_drag_target(cx))
                 }
-            })
-            .children(self.render_trial_end_upsell(window, cx));
+            });
 
         match self.visible_font_size() {
             WhichFontSize::AgentFont => {
@@ -6598,12 +6568,6 @@ struct OnboardingUpsell;
 
 impl Dismissable for OnboardingUpsell {
     const KEY: &'static str = "dismissed-trial-upsell";
-}
-
-struct TrialEndUpsell;
-
-impl Dismissable for TrialEndUpsell {
-    const KEY: &'static str = "dismissed-trial-end-upsell";
 }
 
 /// Test-only helper methods

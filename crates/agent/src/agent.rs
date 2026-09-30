@@ -1879,21 +1879,27 @@ impl NativeAgent {
         if session.thread.read(cx).is_empty() {
             return None;
         }
-        let state = self.projects.get(&session.project_id)?;
-        let folder_paths = PathList::new(
-            &state
-                .project
-                .read(cx)
-                .visible_worktrees(cx)
-                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                .collect::<Vec<_>>(),
-        );
+        let folder_paths = self.session_folder_paths(session, cx)?;
         let id = session.thread.read(cx).id().clone();
         let db_thread = session.thread.update(cx, |thread, cx| {
             thread.set_draft_prompt(draft_prompt);
             thread.to_db(cx)
         });
         Some((id, folder_paths, db_thread))
+    }
+
+    /// The workspace folders a session's thread is saved under, or `None` if its
+    /// project state is gone.
+    fn session_folder_paths(&self, session: &Session, cx: &App) -> Option<PathList> {
+        let state = self.projects.get(&session.project_id)?;
+        Some(PathList::new(
+            &state
+                .project
+                .read(cx)
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                .collect::<Vec<_>>(),
+        ))
     }
 
     /// Commits every non-empty thread's content on shutdown so the async
@@ -2882,6 +2888,25 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         })
     }
 
+    fn fork(
+        &self,
+        session_id: &acp_v1::SessionId,
+        cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
+        self.0.read_with(cx, |agent, cx| {
+            agent
+                .sessions
+                .get(session_id)
+                .filter(|session| !session.thread.read(cx).is_subagent())
+                .map(|_| {
+                    Rc::new(NativeAgentSessionFork {
+                        agent: self.0.clone(),
+                        session_id: session_id.clone(),
+                    }) as _
+                })
+        })
+    }
+
     fn set_title(
         &self,
         session_id: &acp_v1::SessionId,
@@ -3196,6 +3221,81 @@ impl acp_thread::AgentSessionTruncate for NativeAgentSessionTruncate {
     }
 }
 
+struct NativeAgentSessionFork {
+    agent: Entity<NativeAgent>,
+    session_id: acp_v1::SessionId,
+}
+
+impl acp_thread::AgentSessionFork for NativeAgentSessionFork {
+    fn granularity(&self) -> acp_thread::ForkGranularity {
+        acp_thread::ForkGranularity::AnyUserMessage
+    }
+
+    fn run(
+        &self,
+        point: acp_thread::ForkPoint,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::ForkedSession>> {
+        let fork = self.agent.update(cx, |agent, cx| {
+            let session = agent
+                .sessions
+                .get(&self.session_id)
+                .with_context(|| format!("No session found with id {}", self.session_id))?;
+            let folder_paths = agent
+                .session_folder_paths(session, cx)
+                .context("Cannot fork a thread whose project is no longer open")?;
+            let cut = match point {
+                acp_thread::ForkPoint::WholeThread => ForkCut::WholeThread,
+                acp_thread::ForkPoint::BeforeUserMessage {
+                    entry_ix,
+                    draft_message,
+                } => {
+                    let acp_thread = session
+                        .acp_thread
+                        .upgrade()
+                        .context("The thread to fork is no longer open")?;
+                    let message = acp_thread
+                        .read(cx)
+                        .entries()
+                        .get(entry_ix)
+                        .and_then(|entry| entry.user_message())
+                        .and_then(|message| message.client_id.clone())
+                        .with_context(|| {
+                            format!("Entry {entry_ix} is not a user message that can be forked")
+                        })?;
+                    ForkCut::BeforeMessage {
+                        message,
+                        draft_message,
+                    }
+                }
+            };
+            let db_thread = session.thread.read(cx).to_fork_db(&cut, cx)?;
+            anyhow::Ok((folder_paths, db_thread, agent.thread_store.clone()))
+        });
+        let (folder_paths, db_thread, thread_store) = match fork {
+            Ok(fork) => fork,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let database_future = ThreadsDatabase::connect(cx);
+        let session_id = acp_v1::SessionId::new(uuid::Uuid::new_v4().to_string());
+
+        cx.spawn(async move |cx| {
+            let database = database_future.await.map_err(|err| anyhow!(err))?;
+            let db_thread = db_thread.await;
+            let title = db_thread.title.clone();
+            database
+                .save_thread(session_id.clone(), db_thread, folder_paths)
+                .await?;
+            thread_store.update(cx, |store, cx| store.reload(cx));
+            Ok(acp_thread::ForkedSession {
+                session_id,
+                title,
+                draft_prompt: None,
+            })
+        })
+    }
+}
+
 struct NativeAgentSessionRetry {
     connection: NativeAgentConnection,
     session_id: acp_v1::SessionId,
@@ -3305,11 +3405,25 @@ impl NativeThreadEnvironment {
         session_id: acp_v1::SessionId,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, _cx| {
+        let caller_thread_id = self
+            .thread
+            .upgrade()
+            .context("Parent thread no longer exists")?
+            .read(cx)
+            .id()
+            .clone();
+        let (subagent_thread, acp_thread) = self.agent.update(cx, |agent, cx| {
             let session = agent
                 .sessions
                 .get(&session_id)
                 .ok_or_else(|| anyhow!("No subagent session found with id {session_id}"))?;
+            // A forked thread keeps its original's spawn-agent calls, so the model can name
+            // subagents this thread does not own. Only the thread that spawned one may continue it.
+            if session.thread.read(cx).parent_thread_id().as_ref() != Some(&caller_thread_id) {
+                anyhow::bail!(
+                    "Subagent session {session_id} was not started by this thread, so it cannot be continued here. Start a new subagent instead."
+                );
+            }
             let acp_thread = session
                 .acp_thread
                 .upgrade()
@@ -4927,6 +5041,129 @@ mod internal_tests {
                 .is_none(),
             "empty threads should not be persisted by the quit flush"
         );
+    }
+
+    #[gpui::test]
+    async fn test_fork_saves_a_new_thread_and_leaves_the_original_unchanged(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (connection, agent, project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let first_message_id = ClientUserMessageId::new();
+        let second_message_id = ClientUserMessageId::new();
+        cx.update(|cx| {
+            let path_style = project.read(cx).path_style(cx);
+            // Sending a prompt records it in both the native thread and the ACP transcript.
+            acp_thread.update(cx, |acp_thread, cx| {
+                for (id, text) in [(&first_message_id, "first"), (&second_message_id, "second")] {
+                    acp_thread.push_user_content_block(
+                        Some(id.clone()),
+                        agent_client_protocol::schema::v2::ContentBlock::from(text),
+                        cx,
+                    );
+                }
+            });
+            thread.update(cx, |thread, cx| {
+                thread.push_acp_user_block(
+                    first_message_id.clone(),
+                    [acp_v1::ContentBlock::from("first")],
+                    path_style,
+                    cx,
+                );
+                thread.push_acp_user_block(
+                    second_message_id.clone(),
+                    [acp_v1::ContentBlock::from("second")],
+                    path_style,
+                    cx,
+                );
+                thread.set_title("Original".into(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let fork = cx
+            .update(|cx| {
+                acp_thread.read(cx).supports_fork(cx).then_some(())?;
+                connection.fork(&session_id, cx)
+            })
+            .expect("native threads support fork");
+        let second_entry_ix = acp_thread.read_with(cx, |acp_thread, _| {
+            acp_thread
+                .entries()
+                .iter()
+                .position(|entry| {
+                    entry
+                        .user_message()
+                        .and_then(|message| message.client_id.as_ref())
+                        == Some(&second_message_id)
+                })
+                .expect("the second message should be in the transcript")
+        });
+        let forked = cx
+            .update(|cx| {
+                fork.run(
+                    acp_thread::ForkPoint::BeforeUserMessage {
+                        entry_ix: second_entry_ix,
+                        draft_message: true,
+                    },
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_ne!(forked.session_id, session_id);
+        assert_eq!(forked.title, SharedString::from("Original (fork)"));
+        let database = cx.update(|cx| ThreadsDatabase::connect(cx)).await.unwrap();
+        let saved_fork = database
+            .load_thread(forked.session_id.clone())
+            .await
+            .unwrap()
+            .expect("the fork should be saved to the database");
+        assert_eq!(saved_fork.messages.len(), 1);
+        assert_eq!(
+            saved_fork.draft_prompt,
+            Some(vec![acp_v1::ContentBlock::from("second")])
+        );
+        agent.read_with(cx, |agent, cx| {
+            assert!(
+                agent
+                    .thread_store
+                    .read(cx)
+                    .thread_from_session_id(&forked.session_id)
+                    .is_some(),
+                "the thread list should include the fork"
+            );
+        });
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.to_markdown().matches("## User").count(), 2);
+            assert_eq!(thread.title(), Some("Original".into()));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_subagent_threads_cannot_be_forked(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (connection, agent, _project, acp_thread) = setup_native_agent_session(cx).await;
+        let session_id = cx.update(|cx| acp_thread.read(cx).session_id().clone());
+        let thread = cx.update(|cx| native_thread_for_session(&agent, &session_id, cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: thread.downgrade(),
+            acp_thread: acp_thread.downgrade(),
+        };
+        let subagent = cx
+            .update(|cx| environment.create_subagent_thread("subagent".to_string(), None, cx))
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(connection.fork(&session_id, cx).is_some());
+            assert!(connection.fork(&subagent.id(), cx).is_none());
+        });
     }
 
     #[test]

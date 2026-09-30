@@ -8,8 +8,9 @@ use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp_v2};
 use std::cell::RefCell;
 
 use acp_thread::{
-    Elicitation, ElicitationEntryId, ElicitationStatus, SandboxAuthorizationDetails,
-    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, decode_path_escapes,
+    Elicitation, ElicitationEntryId, ElicitationStatus, ForkGranularity, ForkPoint,
+    SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
+    decode_path_escapes,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -1879,12 +1880,6 @@ impl ThreadView {
     fn emit_thread_error_telemetry(&self, error: &ThreadError, cx: &mut Context<Self>) {
         let (error_kind, acp_error_code, message): (&str, Option<SharedString>, SharedString) =
             match error {
-                ThreadError::ZedPaymentRequired => (
-                    "payment_required",
-                    None,
-                    "You reached your free usage limit. Upgrade to Zed Pro for more prompts."
-                        .into(),
-                ),
                 ThreadError::Refusal => {
                     let model_or_agent_name = self.current_model_name(cx);
                     let message = format!(
@@ -2998,6 +2993,124 @@ impl ThreadView {
             .detach_and_log_err(cx);
     }
 
+    fn fork_unavailable_reason(&self, cx: &App) -> Option<&'static str> {
+        let thread = self.thread.read(cx);
+        if self.is_subagent() {
+            Some("Subagent threads cannot be forked.")
+        } else if !thread.supports_fork(cx) {
+            Some("This agent does not support forking threads.")
+        } else if matches!(thread.status(), ThreadStatus::Generating) {
+            Some("Wait for the current response to finish before forking the thread.")
+        } else {
+            None
+        }
+    }
+
+    pub fn can_fork(&self, cx: &App) -> bool {
+        self.fork_unavailable_reason(cx).is_none()
+    }
+
+    /// Whether this thread can be forked before the user message at `entry_ix`.
+    pub(super) fn can_fork_before_user_message(&self, entry_ix: usize, cx: &App) -> bool {
+        if !self.can_fork(cx) {
+            return false;
+        }
+        let thread = self.thread.read(cx);
+        match thread.fork_granularity(cx) {
+            Some(ForkGranularity::AnyUserMessage) => true,
+            Some(ForkGranularity::AfterReplies) => thread.entries()[..entry_ix]
+                .iter()
+                .any(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_))),
+            Some(ForkGranularity::WholeThread) | None => false,
+        }
+    }
+
+    /// Where to fork to continue from the agent turn that ends at `entry_ix`: before the next
+    /// user message with an empty editor, or the whole thread for the last turn. `None` when
+    /// this thread cannot fork there.
+    pub(super) fn fork_point_after_reply(&self, entry_ix: usize, cx: &App) -> Option<ForkPoint> {
+        if !self.can_fork(cx) {
+            return None;
+        }
+        let next_message_ix = self
+            .thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .skip(entry_ix + 1)
+            .find(|(_, entry)| entry.user_message().is_some())
+            .map(|(ix, _)| ix);
+        match next_message_ix {
+            None => Some(ForkPoint::WholeThread),
+            Some(next_message_ix) => self
+                .can_fork_before_user_message(next_message_ix, cx)
+                .then_some(ForkPoint::BeforeUserMessage {
+                    entry_ix: next_message_ix,
+                    draft_message: false,
+                }),
+        }
+    }
+
+    /// Copies this thread's history up to `point` into a new thread and opens it in the agent
+    /// panel with the same agent. The original thread is not modified.
+    pub fn fork(&mut self, point: ForkPoint, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reason) = self.fork_unavailable_reason(cx) {
+            self.handle_thread_error(anyhow!(reason), cx);
+            return;
+        }
+        let thread = self.thread.read(cx);
+        let Some(fork) = thread.connection().fork(thread.session_id(), cx) else {
+            return;
+        };
+        let work_dirs = thread.work_dirs().cloned();
+        let agent = Agent::from(self.agent_id.clone());
+        let fork_task = fork.run(point, cx);
+        let workspace = self.workspace.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let forked = match fork_task.await {
+                Ok(forked) => forked,
+                Err(error) => {
+                    return this.update(cx, |this, cx| {
+                        this.handle_thread_error(error.context("Failed to fork the thread"), cx)
+                    });
+                }
+            };
+            let opened = workspace.update_in(cx, |workspace, window, cx| {
+                let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                    return false;
+                };
+                let title = (!forked.title.is_empty()).then_some(forked.title);
+                panel.update(cx, |panel, cx| {
+                    panel.open_forked_thread(
+                        agent,
+                        forked.session_id,
+                        work_dirs,
+                        title,
+                        forked.draft_prompt,
+                        window,
+                        cx,
+                    )
+                });
+                workspace.focus_panel::<AgentPanel>(window, cx);
+                true
+            })?;
+            if !opened {
+                this.update(cx, |this, cx| {
+                    this.handle_thread_error(
+                        anyhow!(
+                            "The thread was forked and saved to your thread history, but the agent panel is not available to open it."
+                        ),
+                        cx,
+                    )
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     pub fn clear_thread_error(&mut self, cx: &mut Context<Self>) {
         self.thread_error = None;
         self.thread_error_markdown = None;
@@ -3975,6 +4088,7 @@ impl ThreadView {
                                                     content.as_view(),
                                                     None,
                                                     true,
+                                                    false,
                                                     window,
                                                     cx,
                                                 )
@@ -6156,6 +6270,27 @@ impl ThreadView {
                     self.agent_id.clone()
                 };
 
+                let fork_from_message = self
+                    .can_fork_before_user_message(entry_ix, cx)
+                    .then(|| {
+                        IconButton::new(("fork_from_message", entry_ix), IconName::GitBranch)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text(
+                                "Fork from this message: new thread with the conversation before it, and this message ready to edit",
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.fork(
+                                    ForkPoint::BeforeUserMessage {
+                                        entry_ix,
+                                        draft_message: true,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }))
+                    });
+
                 v_flex()
                     .id(("user_message", entry_ix))
                     .map(|this| {
@@ -6308,6 +6443,11 @@ impl ThreadView {
                                 }
                             }),
                     )
+                    .when_some(fork_from_message, |this, button| {
+                        this.child(
+                            h_flex().w_full().justify_end().child(button),
+                        )
+                    })
                     .into_any()
             }
             AgentThreadEntry::AssistantMessage(AssistantMessage {
@@ -6788,6 +6928,18 @@ impl ThreadView {
                 }))
         });
 
+        let fork_after_response_button = self.fork_point_after_reply(entry_ix, cx).map(|point| {
+            IconButton::new(("fork_after_response", entry_ix), IconName::GitBranch)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text(
+                    "Fork from this response: new thread with the conversation up to here",
+                ))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.fork(point.clone(), window, cx);
+                }))
+        });
+
         let scroll_to_recent_user_prompt = IconButton::new(
             ("scroll_to_recent_user_prompt", entry_ix),
             IconName::UserArrowUp,
@@ -6928,6 +7080,9 @@ impl ThreadView {
             )
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
             .when_some(copy_response_button, |this, button| this.child(button))
+            .when_some(fork_after_response_button, |this, button| {
+                this.child(button)
+            })
             .child(scroll_to_recent_user_prompt)
             .when_some(scroll_to_top, |this, button| this.child(button))
             .into_any_element()
@@ -7429,6 +7584,7 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
+        let collapse_code_blocks = !AgentSettings::get_global(cx).expand_code_block;
         v_flex().w_full().gap_3().children(
             content
                 .blocks()
@@ -7436,7 +7592,14 @@ impl ThreadView {
                 .filter(|(_, block)| block.visible_content(cx))
                 .map(|(block_ix, block)| {
                     let content = self.render_output_content_block(
-                        entry_ix, block_ix, block, None, false, window, cx,
+                        entry_ix,
+                        block_ix,
+                        block,
+                        None,
+                        false,
+                        collapse_code_blocks,
+                        window,
+                        cx,
                     );
                     div()
                         .id(("message-content-block", block_ix))
@@ -10232,6 +10395,7 @@ impl ThreadView {
                 block.as_view(),
                 Some(tool_call),
                 card_layout,
+                false,
                 window,
                 cx,
             ),
@@ -10331,6 +10495,7 @@ impl ThreadView {
         content: acp_thread::ContentBlockView<'_>,
         tool_call: Option<&ToolCall>,
         card_layout: bool,
+        collapse_code_blocks: bool,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -10351,6 +10516,7 @@ impl ThreadView {
                     MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
                     cx,
                 )
+                .collapse_code_blocks(collapse_code_blocks)
                 .into_any()
             }
         } else if let Some((resource, _)) = content.embedded_resource() {
@@ -11191,7 +11357,6 @@ impl ThreadView {
             ThreadError::AuthenticationRequired(error) => {
                 self.render_authentication_required_error(error.clone(), cx)
             }
-            ThreadError::ZedPaymentRequired => self.render_zed_payment_required_error(cx),
             ThreadError::RateLimitExceeded { provider } => self.render_error_callout(
                 "Rate Limit Reached",
                 format!(
@@ -11320,24 +11485,6 @@ impl ThreadView {
                     .gap_0p5()
                     .child(self.authenticate_button(cx))
                     .child(self.create_copy_button(error)),
-            )
-            .dismiss_action(self.dismiss_error_button(cx))
-    }
-
-    fn render_zed_payment_required_error(&self, cx: &mut Context<Self>) -> Callout {
-        const ERROR_MESSAGE: &str =
-            "You reached your free usage limit. Upgrade to Zed Pro for more prompts.";
-
-        Callout::new()
-            .severity(Severity::Error)
-            .icon(IconName::XCircle)
-            .title("Free Usage Exceeded")
-            .description(ERROR_MESSAGE)
-            .actions_slot(
-                h_flex()
-                    .gap_0p5()
-                    .child(self.upgrade_button(cx))
-                    .child(self.create_copy_button(ERROR_MESSAGE)),
             )
             .dismiss_action(self.dismiss_error_button(cx))
     }
@@ -11500,18 +11647,6 @@ impl ThreadView {
             .on_click(cx.listener(|this, _, window, cx| {
                 this.clear_thread_error(cx);
                 window.dispatch_action(NewThread.boxed_clone(), cx);
-            }))
-    }
-
-    fn upgrade_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        Button::new("upgrade", "Upgrade")
-            .label_size(LabelSize::Small)
-            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-            .on_click(cx.listener({
-                move |this, _, _, cx| {
-                    this.clear_thread_error(cx);
-                    cx.open_url(&zed_urls::upgrade_to_zed_pro_url(cx));
-                }
             }))
     }
 

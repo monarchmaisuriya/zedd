@@ -4,8 +4,8 @@ use crate::{
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WriteFileTool,
+    decide_permission_from_settings,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -23,8 +23,6 @@ use agent_settings::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
-use client::UserStore;
-use cloud_api_types::Plan;
 use collections::{HashMap, HashSet, IndexMap};
 use fs::Fs;
 use futures::{
@@ -45,7 +43,7 @@ use language_model::{
     LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
     LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolUse,
     LanguageModelToolUseId, MessageContent, ProviderErrorCategory, Role, SelectedModel, Speed,
-    StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    StopReason, TokenUsage,
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -137,6 +135,18 @@ impl std::fmt::Display for NoModelConfiguredError {
 }
 
 impl std::error::Error for NoModelConfiguredError {}
+
+/// Where a native thread is cut when it is forked.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ForkCut {
+    /// Every message, with an empty editor.
+    WholeThread,
+    /// Every message before `message`; with `draft_message`, that message becomes the draft.
+    BeforeMessage {
+        message: ClientUserMessageId,
+        draft_message: bool,
+    },
+}
 
 /// Context passed to a subagent thread for lifecycle management
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1279,7 +1289,6 @@ pub struct Thread {
     pending_summary_generation: Option<Shared<Task<Option<SharedString>>>>,
     summary: Option<SharedString>,
     messages: Vec<Arc<Message>>,
-    user_store: Entity<UserStore>,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
     /// we run tools, report their results.
@@ -1436,7 +1445,6 @@ impl Thread {
             pending_summary_generation: None,
             summary: None,
             messages: Vec::new(),
-            user_store: project.read(cx).user_store(),
             running_turn: None,
             end_turn_at_next_boundary: false,
             pending_message: None,
@@ -1815,7 +1823,6 @@ impl Thread {
             pending_summary_generation: None,
             summary: db_thread.detailed_summary,
             messages: db_thread.messages,
-            user_store: project.read(cx).user_store(),
             running_turn: None,
             end_turn_at_next_boundary: false,
             pending_message: None,
@@ -1956,6 +1963,68 @@ impl Thread {
             thread.initial_project_snapshot = initial_project_snapshot;
             thread
         })
+    }
+
+    /// Snapshots this thread as a new, independent thread holding the messages up to `cut`.
+    /// When the cut asks for it, the cut message's content becomes the draft prompt so it can
+    /// be edited and resent on the new branch.
+    pub fn to_fork_db(&self, cut: &ForkCut, cx: &App) -> Result<Task<DbThread>> {
+        let (kept_message_count, draft_prompt) = match cut {
+            ForkCut::BeforeMessage {
+                message: before_message,
+                draft_message,
+            } => {
+                let (position, content) = self
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, message)| match &**message {
+                        Message::User(UserMessage { id, content }) if id == before_message => {
+                            Some((position, content.clone()))
+                        }
+                        _ => None,
+                    })
+                    .with_context(|| format!("Message {before_message:?} not found in thread"))?;
+                let draft_prompt = draft_message.then(|| {
+                    content
+                        .iter()
+                        .cloned()
+                        .map(acp::ContentBlock::from)
+                        .collect::<Vec<_>>()
+                });
+                (position, draft_prompt)
+            }
+            ForkCut::WholeThread if self.messages.is_empty() => {
+                anyhow::bail!("Cannot fork a thread that has no messages")
+            }
+            // The original thread keeps its own unsent draft.
+            ForkCut::WholeThread => (self.messages.len(), None),
+        };
+        let title = self
+            .title()
+            .filter(|title| !title.is_empty())
+            .map(|title| SharedString::from(format!("{title} (fork)")))
+            .unwrap_or_default();
+        let db_thread = self.to_db(cx);
+
+        Ok(cx.background_spawn(async move {
+            let mut thread = db_thread.await;
+            for message in thread.messages.drain(kept_message_count..) {
+                if let Message::User(message) = &*message {
+                    thread.request_token_usage.remove(&message.id);
+                }
+            }
+            thread.title = title;
+            // The database uses `updated_at` as a new row's creation time.
+            thread.updated_at = Utc::now();
+            thread.draft_prompt = draft_prompt;
+            thread.detailed_summary = None;
+            thread.ui_scroll_position = None;
+            // Each thread lazily creates its own sandbox temp dir; sharing one would let the
+            // two threads' terminals overwrite each other's files.
+            thread.sandboxed_terminal_temp_dir = None;
+            thread
+        }))
     }
 
     /// Create a snapshot of the current project state including git information and unsaved buffers.
@@ -2214,7 +2283,6 @@ impl Thread {
             self.project.clone(),
             environment.clone(),
         ));
-        self.add_tool(WebSearchTool);
 
         self.add_tool(AskUserTool);
 
@@ -3163,8 +3231,7 @@ impl Thread {
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
         let retry = this.update(cx, |this, cx| {
-            let user_store = this.user_store.read(cx);
-            this.handle_completion_error(error, attempt, user_store.plan(), cx)
+            this.handle_completion_error(error, attempt, cx)
         })??;
         let timer = cx.background_executor().timer(retry.duration);
         event_stream.send_retry(retry);
@@ -3373,7 +3440,6 @@ impl Thread {
         &mut self,
         error: LanguageModelCompletionError,
         attempt: u8,
-        plan: Option<Plan>,
         cx: &mut Context<Self>,
     ) -> Result<acp_thread::RetryStatus> {
         if let LanguageModelCompletionError::ProviderRejection {
@@ -3384,19 +3450,9 @@ impl Thread {
             self.mark_token_limit_exceeded(*tokens, cx);
         }
 
-        let Some(model) = self.model() else {
+        if self.model().is_none() {
             return Err(anyhow!(error));
         };
-
-        let auto_retry = if model.provider_id() == ZED_CLOUD_PROVIDER_ID {
-            plan.is_some()
-        } else {
-            true
-        };
-
-        if !auto_retry {
-            return Err(anyhow!(error));
-        }
 
         let Some(strategy) = Self::retry_strategy_for(&error) else {
             return Err(anyhow!(error));
@@ -7934,6 +7990,56 @@ mod tests {
             matches!(&event, Some(Ok(ThreadEvent::ContextCompaction(_)))),
             "expected the compaction to replay after the marker, got {event:?}"
         );
+    }
+
+    #[gpui::test]
+    async fn test_fork_keeps_or_drops_manual_compaction_marker_and_summary_together(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _event_stream, _) = setup_thread_for_test(cx).await;
+        let marker_id = ClientUserMessageId::new();
+        let after_compaction_id = ClientUserMessageId::new();
+        let messages = vec![
+            user_text_message(ClientUserMessageId::new(), "before"),
+            agent_text_message("answer"),
+            Arc::new(Message::User(UserMessage {
+                id: marker_id.clone(),
+                content: Arc::from([]),
+            })),
+            summary_compaction("summary"),
+            user_text_message(ClientUserMessageId::new(), "after"),
+            agent_text_message("after answer"),
+            user_text_message(after_compaction_id.clone(), "last"),
+        ];
+        thread.update(cx, |thread, _| thread.messages = messages.clone());
+
+        let fork_after_compaction = thread
+            .read_with(cx, |thread, cx| {
+                thread.to_fork_db(
+                    &ForkCut::BeforeMessage {
+                        message: after_compaction_id.clone(),
+                        draft_message: true,
+                    },
+                    cx,
+                )
+            })
+            .unwrap()
+            .await;
+        assert_eq!(fork_after_compaction.messages, messages[..6]);
+
+        let fork_before_compaction = thread
+            .read_with(cx, |thread, cx| {
+                thread.to_fork_db(
+                    &ForkCut::BeforeMessage {
+                        message: marker_id.clone(),
+                        draft_message: true,
+                    },
+                    cx,
+                )
+            })
+            .unwrap()
+            .await;
+        assert_eq!(fork_before_compaction.messages, messages[..2]);
     }
 
     /// When `agent.compaction_model` is configured, manual `/compact` streams

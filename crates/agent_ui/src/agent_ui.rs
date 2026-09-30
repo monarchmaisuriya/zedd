@@ -246,6 +246,8 @@ actions!(
         FocusRight,
         /// Opens the active thread as a markdown file.
         OpenActiveThreadAsMarkdown,
+        /// Copies the active thread's conversation into a new thread, leaving the original unchanged.
+        ForkThread,
         /// Opens the agent diff view to review changes.
         OpenAgentDiff,
         /// Copies the current thread to the clipboard as JSON for debugging.
@@ -274,8 +276,6 @@ actions!(
         Follow,
         /// Resets the trial upsell notification.
         ResetTrialUpsell,
-        /// Resets the trial end upsell notification.
-        ResetTrialEndUpsell,
         /// Re-enables the fast mode warning for every provider and model.
         ResetFastModeWarnings,
         /// Opens the "Add Context" menu in the message editor.
@@ -1001,6 +1001,7 @@ mod tests {
             enable_feedback: false,
             expand_edit_card: true,
             expand_terminal_card: true,
+            expand_code_block: true,
             terminal_init_command: None,
             cancel_generation_on_terminal_stop: true,
             use_modifier_to_send: true,
