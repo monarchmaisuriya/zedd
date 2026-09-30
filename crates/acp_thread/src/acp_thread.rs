@@ -3742,6 +3742,16 @@ impl AcpThread {
         self.connection.truncate(&self.session_id, cx).is_some()
     }
 
+    pub fn supports_fork(&self, cx: &App) -> bool {
+        self.connection.fork(&self.session_id, cx).is_some()
+    }
+
+    pub fn fork_granularity(&self, cx: &App) -> Option<ForkGranularity> {
+        self.connection
+            .fork(&self.session_id, cx)
+            .map(|fork| fork.granularity())
+    }
+
     pub fn work_dirs(&self) -> Option<&PathList> {
         self.work_dirs.as_ref()
     }

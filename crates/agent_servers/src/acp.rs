@@ -268,6 +268,9 @@ pub struct AcpConnection {
     id: AgentId,
     telemetry_id: SharedString,
     agent_version: Option<SharedString>,
+    /// Whether the agent cuts forks at a reply named in the Claude ACP adapter's private
+    /// `_meta.jetbrains.air.fork` extension, which it does not advertise.
+    reads_air_fork_points: bool,
     connection: ConnectionTo<Agent>,
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     pending_sessions: RefCell<HashMap<acp::SessionId, PendingAcpSession>>,
@@ -851,6 +854,9 @@ impl AcpConnection {
         });
 
         let agent_info = response.agent_info;
+        let reads_air_fork_points = agent_info
+            .as_ref()
+            .is_some_and(|info| info.name == CLAUDE_AGENT_ACP_NAME);
         let telemetry_id = agent_info
             .as_ref()
             // Use the one the agent provides if we have one
@@ -914,6 +920,7 @@ impl AcpConnection {
             connection,
             telemetry_id,
             agent_version,
+            reads_air_fork_points,
             sessions,
             pending_sessions: RefCell::new(HashMap::default()),
             agent_capabilities: response.agent_capabilities,
@@ -955,6 +962,7 @@ impl AcpConnection {
             id: agent_id,
             telemetry_id: "test".into(),
             agent_version: None,
+            reads_air_fork_points: false,
             connection,
             sessions,
             pending_sessions: RefCell::new(HashMap::default()),
@@ -1419,6 +1427,16 @@ impl SessionDirectories {
         mcp_servers: Vec<acp::McpServer>,
     ) -> acp::ResumeSessionRequest {
         acp::ResumeSessionRequest::new(session_id, self.cwd)
+            .additional_directories(self.additional_directories)
+            .mcp_servers(mcp_servers)
+    }
+
+    fn into_fork_session_request(
+        self,
+        session_id: acp::SessionId,
+        mcp_servers: Vec<acp::McpServer>,
+    ) -> acp::ForkSessionRequest {
+        acp::ForkSessionRequest::new(session_id, self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
     }
@@ -1944,6 +1962,34 @@ impl AgentConnection for AcpConnection {
         self.session_list.clone().map(|s| s as _)
     }
 
+    fn fork(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionFork>> {
+        // A forked session can only be shown by loading or resuming it, since the fork
+        // response does not replay history.
+        let capabilities = &self.agent_capabilities;
+        let can_open_forked_session =
+            capabilities.load_session || capabilities.session_capabilities.resume.is_some();
+        if capabilities.session_capabilities.fork.is_none() || !can_open_forked_session {
+            return None;
+        }
+        let thread = self.sessions.borrow().get(session_id)?.thread.clone();
+        let granularity = if self.reads_air_fork_points {
+            acp_thread::ForkGranularity::AfterReplies
+        } else {
+            acp_thread::ForkGranularity::WholeThread
+        };
+        Some(Rc::new(AcpSessionFork {
+            connection: self.connection.clone(),
+            session_id: session_id.clone(),
+            thread,
+            supports_additional_directories: self.supports_session_additional_directories(),
+            granularity,
+        }) as _)
+    }
+
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
     }
@@ -2381,6 +2427,23 @@ pub mod test_support {
                         load_session_count.fetch_add(1, Ordering::SeqCst);
                         responder.respond(acp::LoadSessionResponse::new())
                     }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: acp::ForkSessionRequest, responder, _cx| {
+                    // Encode the requested fork point in the new id so tests can check it.
+                    let point = req
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("jetbrains")?.pointer("/air/fork/messageId"))
+                        .and_then(|message_id| message_id.as_str())
+                        .unwrap_or("whole")
+                        .to_string();
+                    responder.respond(acp::ForkSessionResponse::new(acp::SessionId::new(format!(
+                        "{}-fork-{point}",
+                        req.session_id
+                    ))))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -3358,6 +3421,184 @@ mod tests {
                 additional_directories: vec![std::path::PathBuf::from("/workspace-a")],
             }
         );
+    }
+
+    #[gpui::test]
+    async fn fork_is_whole_thread_only_and_requires_the_agent_capability(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let mut harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        let any_session = acp::SessionId::new("any");
+        cx.update(|cx| {
+            assert!(
+                harness.connection.fork(&any_session, cx).is_none(),
+                "no fork without the agent's session.fork capability"
+            );
+        });
+
+        let capabilities = &mut Rc::get_mut(&mut harness.connection)
+            .expect("test harness should own the only ACP connection handle")
+            .agent_capabilities;
+        capabilities.session_capabilities.fork = Some(acp::SessionForkCapabilities::new());
+        capabilities.load_session = false;
+        cx.update(|cx| {
+            assert!(
+                harness.connection.fork(&any_session, cx).is_none(),
+                "no fork when the forked session could not be loaded or resumed"
+            );
+        });
+        Rc::get_mut(&mut harness.connection)
+            .expect("test harness should own the only ACP connection handle")
+            .agent_capabilities
+            .load_session = true;
+
+        let thread = cx
+            .update(|cx| {
+                harness.connection.clone().new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("new session should start");
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let fork = cx
+            .update(|cx| harness.connection.fork(&session_id, cx))
+            .expect("fork should be offered when the agent advertises it");
+        assert_eq!(fork.granularity(), acp_thread::ForkGranularity::WholeThread);
+
+        let error = cx
+            .update(|cx| {
+                fork.run(
+                    acp_thread::ForkPoint::BeforeUserMessage {
+                        entry_ix: 0,
+                        draft_message: true,
+                    },
+                    cx,
+                )
+            })
+            .await
+            .err()
+            .expect("ACP cannot fork from a message");
+        assert!(
+            error.to_string().contains("only fork the whole thread"),
+            "{error}"
+        );
+
+        let forked = cx
+            .update(|cx| fork.run(acp_thread::ForkPoint::WholeThread, cx))
+            .await
+            .expect("whole-thread fork should succeed");
+        assert_eq!(
+            forked.session_id,
+            acp::SessionId::new(format!("{session_id}-fork-whole"))
+        );
+    }
+
+    #[gpui::test]
+    async fn claude_adapter_forks_after_the_reply_before_a_message(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+        let mut harness = test_support::connect_fake_acp_connection(project.clone(), cx).await;
+        let connection = Rc::get_mut(&mut harness.connection)
+            .expect("test harness should own the only ACP connection handle");
+        connection.agent_capabilities.session_capabilities.fork =
+            Some(acp::SessionForkCapabilities::new());
+        // Set when the agent reports itself as the Claude ACP adapter.
+        connection.reads_air_fork_points = true;
+
+        let thread = cx
+            .update(|cx| {
+                harness.connection.clone().new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("new session should start");
+        thread.update(cx, |thread, cx| {
+            for update in [
+                acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new("first".into())),
+                acp::SessionUpdate::AgentMessageChunk(
+                    acp::ContentChunk::new("first reply".into())
+                        .message_id(acp::MessageId::new("reply-1")),
+                ),
+                acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new("second".into())),
+            ] {
+                thread.handle_session_update(update, cx).unwrap();
+            }
+        });
+        let (session_id, first_ix, second_ix) = thread.read_with(cx, |thread, _| {
+            let user_entries = thread
+                .entries()
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.user_message().is_some())
+                .map(|(ix, _)| ix)
+                .collect::<Vec<_>>();
+            (
+                thread.session_id().clone(),
+                user_entries[0],
+                user_entries[1],
+            )
+        });
+        let fork = cx
+            .update(|cx| harness.connection.fork(&session_id, cx))
+            .expect("fork should be offered when the agent advertises it");
+        assert_eq!(
+            fork.granularity(),
+            acp_thread::ForkGranularity::AfterReplies
+        );
+
+        let forked = cx
+            .update(|cx| {
+                fork.run(
+                    acp_thread::ForkPoint::BeforeUserMessage {
+                        entry_ix: second_ix,
+                        draft_message: true,
+                    },
+                    cx,
+                )
+            })
+            .await
+            .expect("fork after the reply should succeed");
+        assert_eq!(
+            forked.session_id,
+            acp::SessionId::new(format!("{session_id}-fork-reply-1"))
+        );
+        assert_eq!(
+            forked.draft_prompt,
+            Some(vec![acp::ContentBlock::from("second")])
+        );
+
+        let error = cx
+            .update(|cx| {
+                fork.run(
+                    acp_thread::ForkPoint::BeforeUserMessage {
+                        entry_ix: first_ix,
+                        draft_message: true,
+                    },
+                    cx,
+                )
+            })
+            .await
+            .err()
+            .expect("there is no reply before the first message");
+        assert!(error.to_string().contains("no agent reply"), "{error}");
     }
 
     async fn connect_session_delete_test_agent(
@@ -4956,6 +5197,147 @@ fn config_state(
 
     let modes = modes.map(|modes| Rc::new(RefCell::new(modes)));
     (modes, None)
+}
+
+/// The `agentInfo.name` of the Claude ACP adapter, which reads fork points from
+/// `_meta.jetbrains.air.fork`.
+const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
+
+/// Forks through ACP `session/fork`. Standard ACP copies the whole session; agents with
+/// [`acp_thread::ForkGranularity::AfterReplies`] also accept a reply to cut after.
+struct AcpSessionFork {
+    connection: ConnectionTo<Agent>,
+    session_id: acp::SessionId,
+    thread: WeakEntity<AcpThread>,
+    supports_additional_directories: bool,
+    granularity: acp_thread::ForkGranularity,
+}
+
+impl AcpSessionFork {
+    /// The reply to cut after for a fork before the user message at `entry_ix`, as the
+    /// `_meta` the Claude ACP adapter reads, plus that message as a draft when asked for.
+    fn air_fork_point(
+        thread: &AcpThread,
+        entry_ix: usize,
+        draft_message: bool,
+    ) -> Result<(acp::Meta, Option<Vec<acp::ContentBlock>>)> {
+        let entries = thread.entries();
+        let user_message = entries
+            .get(entry_ix)
+            .and_then(|entry| entry.user_message())
+            .with_context(|| format!("Entry {entry_ix} is not a user message"))?;
+        let reply_id = entries[..entry_ix]
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                acp_thread::AgentThreadEntry::AssistantMessage(message) => {
+                    last_reply_message_id(message)
+                }
+                _ => None,
+            })
+            .context("There is no agent reply before this message to fork from.")?;
+        let meta = acp::Meta::from_iter([(
+            "jetbrains".to_string(),
+            serde_json::json!({ "air": { "fork": { "version": 1, "messageId": reply_id } } }),
+        )]);
+        let draft = draft_message
+            .then(|| {
+                user_message
+                    .content
+                    .source_blocks()
+                    .iter()
+                    .cloned()
+                    .map(acp_thread::content::to_v1)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        Ok((meta, draft))
+    }
+}
+
+/// The agent's id for the last message in a reply, which the Claude ACP adapter uses as a
+/// fork point.
+fn last_reply_message_id(message: &acp_thread::AssistantMessage) -> Option<String> {
+    message.chunks.iter().rev().find_map(|chunk| {
+        let (acp_thread::AssistantMessageChunk::Message { identity, .. }
+        | acp_thread::AssistantMessageChunk::Thought { identity, .. }) = chunk;
+        match identity {
+            acp_thread::MessageIdentity::Legacy(Some(id)) => Some(id.0.to_string()),
+            acp_thread::MessageIdentity::Keyed(id) => Some(id.0.to_string()),
+            acp_thread::MessageIdentity::Legacy(None) => None,
+        }
+    })
+}
+
+impl acp_thread::AgentSessionFork for AcpSessionFork {
+    fn granularity(&self) -> acp_thread::ForkGranularity {
+        self.granularity
+    }
+
+    fn run(
+        &self,
+        point: acp_thread::ForkPoint,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::ForkedSession>> {
+        let Some(thread) = self.thread.upgrade() else {
+            return Task::ready(Err(anyhow!("The thread to fork is no longer open.")));
+        };
+        let thread = thread.read(cx);
+        let (meta, draft_prompt) = match point {
+            acp_thread::ForkPoint::WholeThread => (None, None),
+            acp_thread::ForkPoint::BeforeUserMessage { .. }
+                if self.granularity == acp_thread::ForkGranularity::WholeThread =>
+            {
+                return Task::ready(Err(anyhow!(
+                    "This agent can only fork the whole thread, not from a message."
+                )));
+            }
+            acp_thread::ForkPoint::BeforeUserMessage {
+                entry_ix,
+                draft_message,
+            } => match Self::air_fork_point(thread, entry_ix, draft_message) {
+                Ok((meta, draft)) => (Some(meta), draft),
+                Err(error) => return Task::ready(Err(error)),
+            },
+        };
+        let Some(work_dirs) = thread.work_dirs() else {
+            return Task::ready(Err(anyhow!(
+                "The thread has no working directory to fork into."
+            )));
+        };
+        let directories = match session_directories_from_work_dirs(
+            work_dirs,
+            self.supports_additional_directories,
+        ) {
+            Ok(directories) => directories,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let request = directories
+            .into_fork_session_request(
+                self.session_id.clone(),
+                mcp_servers_for_project(thread.project(), cx),
+            )
+            .meta(meta);
+        let title = thread
+            .title()
+            .filter(|title| !title.is_empty())
+            .map(|title| SharedString::from(format!("{title} (fork)")))
+            .unwrap_or_default();
+        let connection = self.connection.clone();
+
+        cx.spawn(async move |_| {
+            let response = connection
+                .send_request(request)
+                .block_task()
+                .await
+                .map_err(map_acp_error)?;
+            Ok(acp_thread::ForkedSession {
+                session_id: response.session_id,
+                title,
+                draft_prompt,
+            })
+        })
+    }
 }
 
 struct AcpSessionModes {

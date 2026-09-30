@@ -4103,6 +4103,243 @@ async fn test_truncate_second_message(cx: &mut TestAppContext) {
     assert_first_message_state(cx);
 }
 
+fn send_and_respond(
+    thread: &Entity<Thread>,
+    fake: &FakeLanguageModelProvider,
+    model: &LanguageModel,
+    message: &str,
+    cx: &mut TestAppContext,
+) -> ClientUserMessageId {
+    let message_id = ClientUserMessageId::new();
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(message_id.clone(), [message], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_text(model, &format!("{message} response"));
+    fake.send_last_event(
+        model,
+        LanguageModelCompletionEvent::UsageUpdate(language_model::TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        }),
+    );
+    fake.end_last(model);
+    cx.run_until_parked();
+    message_id
+}
+
+#[gpui::test]
+async fn test_fork_before_message_keeps_earlier_history_and_drafts_the_cut_message(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let message_1_id = send_and_respond(&thread, &fake, &model, "Message 1", cx);
+    let message_2_id = send_and_respond(&thread, &fake, &model, "Message 2", cx);
+    send_and_respond(&thread, &fake, &model, "Message 3", cx);
+    thread.update(cx, |thread, cx| {
+        thread.set_title("Original".into(), cx);
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        thread.sandboxed_terminal_temp_dir(cx).unwrap();
+    });
+    let original_markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+
+    let fork = thread
+        .read_with(cx, |thread, cx| {
+            thread.to_fork_db(
+                &ForkCut::BeforeMessage {
+                    message: message_2_id.clone(),
+                    draft_message: true,
+                },
+                cx,
+            )
+        })
+        .unwrap()
+        .await;
+
+    assert_eq!(
+        crate::thread::messages_to_markdown(&fork.messages),
+        indoc! {"
+            ## User
+
+            Message 1
+
+            ## Assistant
+
+            Message 1 response
+        "}
+    );
+    assert_eq!(
+        fork.draft_prompt,
+        Some(vec![acp::ContentBlock::from("Message 2")])
+    );
+    assert_eq!(
+        fork.request_token_usage.keys().collect::<Vec<_>>(),
+        vec![&message_1_id]
+    );
+    assert_eq!(fork.title, SharedString::from("Original (fork)"));
+    assert_eq!(fork.detailed_summary, None);
+    assert_eq!(fork.sandboxed_terminal_temp_dir, None);
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.to_markdown(), original_markdown);
+        assert_eq!(thread.title(), Some("Original".into()));
+    });
+}
+
+#[gpui::test]
+async fn test_fork_before_first_message_has_no_history(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let message_1_id = send_and_respond(&thread, &fake, &model, "Message 1", cx);
+    send_and_respond(&thread, &fake, &model, "Message 2", cx);
+
+    let fork = thread
+        .read_with(cx, |thread, cx| {
+            thread.to_fork_db(
+                &ForkCut::BeforeMessage {
+                    message: message_1_id.clone(),
+                    draft_message: true,
+                },
+                cx,
+            )
+        })
+        .unwrap()
+        .await;
+
+    assert!(fork.messages.is_empty());
+    assert!(fork.request_token_usage.is_empty());
+    assert_eq!(
+        fork.draft_prompt,
+        Some(vec![acp::ContentBlock::from("Message 1")])
+    );
+}
+
+#[gpui::test]
+async fn test_fork_after_reply_keeps_that_reply_and_leaves_the_editor_empty(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    send_and_respond(&thread, &fake, &model, "Message 1", cx);
+    let message_2_id = send_and_respond(&thread, &fake, &model, "Message 2", cx);
+
+    let fork = thread
+        .read_with(cx, |thread, cx| {
+            thread.to_fork_db(
+                &ForkCut::BeforeMessage {
+                    message: message_2_id.clone(),
+                    draft_message: false,
+                },
+                cx,
+            )
+        })
+        .unwrap()
+        .await;
+
+    assert_eq!(
+        crate::thread::messages_to_markdown(&fork.messages),
+        indoc! {"
+            ## User
+
+            Message 1
+
+            ## Assistant
+
+            Message 1 response
+        "}
+    );
+    assert_eq!(fork.draft_prompt, None);
+}
+
+#[gpui::test]
+async fn test_fork_whole_thread_copies_every_message_but_not_the_draft(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let message_1_id = send_and_respond(&thread, &fake, &model, "Message 1", cx);
+    let message_2_id = send_and_respond(&thread, &fake, &model, "Message 2", cx);
+    thread.update(cx, |thread, _| {
+        thread.set_draft_prompt(Some(vec!["unsent".into()]))
+    });
+
+    let fork = thread
+        .read_with(cx, |thread, cx| {
+            thread.to_fork_db(&ForkCut::WholeThread, cx)
+        })
+        .unwrap()
+        .await;
+
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(
+            crate::thread::messages_to_markdown(&fork.messages),
+            thread.to_markdown()
+        );
+        assert_eq!(
+            thread.draft_prompt(),
+            Some([acp::ContentBlock::from("unsent")].as_slice())
+        );
+    });
+    assert_eq!(
+        fork.request_token_usage
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        HashSet::from_iter([message_1_id, message_2_id])
+    );
+    assert_eq!(fork.draft_prompt, None);
+}
+
+#[gpui::test]
+async fn test_fork_fails_for_unknown_message_or_empty_thread(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    let empty_fork = thread.read_with(cx, |thread, cx| {
+        thread.to_fork_db(&ForkCut::WholeThread, cx).err()
+    });
+    assert!(empty_fork.is_some(), "an empty thread must not be forked");
+
+    send_and_respond(&thread, &fake, &model, "Message 1", cx);
+    let unknown_message = ClientUserMessageId::new();
+    let error = thread
+        .read_with(cx, |thread, cx| {
+            thread
+                .to_fork_db(
+                    &ForkCut::BeforeMessage {
+                        message: unknown_message.clone(),
+                        draft_message: true,
+                    },
+                    cx,
+                )
+                .err()
+        })
+        .expect("forking before a message the thread does not have must fail");
+    assert!(error.to_string().contains("not found in thread"), "{error}");
+}
+
 #[gpui::test]
 async fn test_title_generation(cx: &mut TestAppContext) {
     let ThreadTest {
@@ -4407,8 +4644,8 @@ async fn test_agent_connection(cx: &mut TestAppContext) {
         let client = Client::new(clock, http_client, cx);
         let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
         language_model::init(cx);
-        RefreshLlmTokenListener::register(client.clone(), user_store.clone(), cx);
-        language_models::init(user_store, client.clone(), cx);
+        RefreshLlmTokenListener::register(client.clone(), user_store, cx);
+        language_models::init(client.clone(), cx);
     });
     let fake = cx.update(LanguageModelRegistry::test);
     cx.executor().forbid_parking();
@@ -5197,8 +5434,8 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
                 let client = Client::production(cx);
                 let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
                 language_model::init(cx);
-                RefreshLlmTokenListener::register(client.clone(), user_store.clone(), cx);
-                language_models::init(user_store, client.clone(), cx);
+                RefreshLlmTokenListener::register(client.clone(), user_store, cx);
+                language_models::init(client.clone(), cx);
                 Arc::new(FakeLanguageModelProvider::default())
             }
         };
@@ -6490,6 +6727,53 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_resume_subagent_rejects_thread_that_did_not_spawn_it(cx: &mut TestAppContext) {
+    let test = SubagentCompactionTest::new(cx).await;
+    let connection = Rc::new(NativeAgentConnection(test._agent.clone()));
+    let project = test
+        ._acp_thread
+        .read_with(cx, |thread, _| thread.project().clone());
+    let other_acp_thread = cx
+        .update(|cx| connection.new_session(project, PathList::new(&[Path::new("")]), cx))
+        .await
+        .unwrap();
+    let other_session_id = other_acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let other_thread = test._agent.read_with(cx, |agent, _| {
+        agent
+            .sessions
+            .get(&other_session_id)
+            .unwrap()
+            .thread
+            .clone()
+    });
+    let other_environment = NativeThreadEnvironment {
+        agent: test._agent.downgrade(),
+        thread: other_thread.downgrade(),
+        acp_thread: other_acp_thread.downgrade(),
+    };
+
+    let error = cx
+        .update(|cx| other_environment.resume_subagent_thread(test.handle.id(), cx))
+        .err()
+        .expect("a thread must not continue a subagent it did not spawn");
+    assert!(
+        error.to_string().contains("was not started by this thread"),
+        "unexpected error: {error}"
+    );
+    cx.run_until_parked();
+    assert_eq!(test.fake.pending_completions(), Vec::new());
+    test.assert_stopped(cx);
+
+    let handle = cx
+        .update(|cx| {
+            test.environment
+                .resume_subagent_thread(test.handle.id(), cx)
+        })
+        .unwrap();
+    assert_eq!(handle.id(), test.handle.id());
+}
+
+#[gpui::test]
 async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestAppContext) {
     let fake = init_test(cx);
 
@@ -7751,49 +8035,6 @@ async fn test_copy_path_tool_deny_rule_blocks_copy(cx: &mut TestAppContext) {
         result.unwrap_err().contains("blocked"),
         "error should mention the copy was blocked"
     );
-}
-
-#[gpui::test]
-async fn test_web_search_tool_deny_rule_blocks_search(cx: &mut TestAppContext) {
-    init_test(cx);
-
-    cx.update(|cx| {
-        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
-        settings.tool_permissions.tools.insert(
-            WebSearchTool::NAME.into(),
-            agent_settings::ToolRules {
-                default: Some(settings::ToolPermissionMode::Allow),
-                always_allow: vec![],
-                always_deny: vec![
-                    agent_settings::CompiledRegex::new(r"internal\.company", false).unwrap(),
-                ],
-                always_confirm: vec![],
-                invalid_patterns: vec![],
-            },
-        );
-        agent_settings::AgentSettings::override_global(settings, cx);
-    });
-
-    #[allow(clippy::arc_with_non_send_sync)]
-    let tool = Arc::new(crate::WebSearchTool);
-    let (event_stream, _rx) = crate::ToolCallEventStream::test();
-
-    let input: crate::WebSearchToolInput =
-        serde_json::from_value(json!({"query": "internal.company.com secrets"})).unwrap();
-
-    let task = cx.update(|cx| tool.run(ToolInput::resolved(input), event_stream, cx));
-
-    let result = task.await;
-    assert!(result.is_err(), "expected search to be blocked");
-    match result.unwrap_err() {
-        crate::WebSearchToolOutput::Error { error } => {
-            assert!(
-                error.contains("blocked"),
-                "error should mention the search was blocked"
-            );
-        }
-        other => panic!("expected Error variant, got: {other:?}"),
-    }
 }
 
 #[gpui::test]

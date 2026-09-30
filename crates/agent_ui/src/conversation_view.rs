@@ -34,9 +34,7 @@ use gpui::{
     linear_gradient, list, pulsating_between,
 };
 use language::{Buffer, Language, Rope};
-use language_model::{
-    LanguageModelCompletionError, ProviderErrorCategory, ZED_CLOUD_PROVIDER_NAME,
-};
+use language_model::{LanguageModelCompletionError, ProviderErrorCategory};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle,
 };
@@ -124,7 +122,6 @@ enum ThreadFeedback {
 
 #[derive(Debug)]
 pub(crate) enum ThreadError {
-    ZedPaymentRequired,
     DataRetentionConsentRequired,
     Refusal,
     AuthenticationRequired(SharedString),
@@ -188,11 +185,6 @@ impl From<anyhow::Error> for ThreadError {
                         provider: provider.to_string().into(),
                     },
                     ProviderErrorCategory::PromptTooLarge { .. } => Self::PromptTooLarge,
-                    ProviderErrorCategory::PaymentRequired
-                        if provider == &ZED_CLOUD_PROVIDER_NAME =>
-                    {
-                        Self::ZedPaymentRequired
-                    }
                     ProviderErrorCategory::Authentication => Self::AuthenticationFailed {
                         provider: provider.to_string().into(),
                     },
@@ -3747,7 +3739,7 @@ fn plan_label_markdown_style(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use acp_thread::StubAgentConnection;
+    use acp_thread::{ForkGranularity, ForkPoint, StubAgentConnection};
     use action_log::ActionLog;
     use agent::{AgentTool, EditFileTool, FetchTool, TerminalTool, ToolPermissionContext};
     use agent_servers::FakeAcpAgentServer;
@@ -3837,25 +3829,6 @@ pub(crate) mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn test_payment_required_from_zed_uses_upgrade_prompt() {
-        let provider_error = LanguageModelCompletionError::from_provider_response(
-            ZED_CLOUD_PROVIDER_NAME,
-            Some(http_client::StatusCode::PAYMENT_REQUIRED),
-            None,
-            "Payment required".to_string(),
-            None,
-            ProviderErrorCategory::PaymentRequired,
-        );
-
-        let error = ThreadError::from(anyhow!(provider_error));
-
-        assert!(
-            matches!(error, ThreadError::ZedPaymentRequired),
-            "expected Zed upgrade prompt, got: {error:?}"
-        );
     }
 
     #[gpui::test]
@@ -5998,6 +5971,231 @@ pub(crate) mod tests {
             .expect("prompt should succeed");
         cx.run_until_parked();
         (conversation_view, cx)
+    }
+
+    #[gpui::test]
+    async fn test_fork_is_unavailable_when_the_agent_does_not_support_it(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(!view.can_fork(cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fork_is_offered_only_for_idle_root_threads(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection =
+            StubAgentConnection::new().with_supports_fork(ForkGranularity::AnyUserMessage);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let root_session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(view.can_fork(cx));
+        });
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(
+                !view.can_fork(cx),
+                "a half-written reply must not be copied into a fork"
+            );
+        });
+
+        connection.end_turn(root_session_id.clone(), acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(view.can_fork(cx));
+        });
+
+        let subagent_view = conversation_view.update_in(cx, |view, window, cx| {
+            let project = view.project.clone();
+            let conversation = view.as_connected().unwrap().conversation.clone();
+            let subagent_thread = create_test_acp_thread(
+                Some(root_session_id.clone()),
+                "subagent",
+                Rc::new(connection.clone()),
+                project,
+                cx,
+            );
+            view.new_thread_view(subagent_thread, conversation, false, None, window, cx)
+        });
+        subagent_view.read_with(cx, |view, cx| {
+            assert!(!view.can_fork(cx));
+        });
+    }
+
+    /// Sends two prompts that each get a reply, and returns the entry indices of the prompts
+    /// and of the replies.
+    fn send_two_turns(
+        conversation_view: &Entity<ConversationView>,
+        connection: &StubAgentConnection,
+        cx: &mut VisualTestContext,
+    ) -> (Vec<usize>, Vec<usize>) {
+        for text in ["One", "Two"] {
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(format!("{text} reply").into()),
+            )]);
+            message_editor(conversation_view, cx).update_in(cx, |editor, window, cx| {
+                editor.set_text(text, window, cx);
+            });
+            active_thread(conversation_view, cx).update_in(cx, |view, window, cx| {
+                view.send(window, cx);
+            });
+            cx.run_until_parked();
+        }
+        active_thread(conversation_view, cx).read_with(cx, |view, cx| {
+            let entries = view.thread.read(cx).entries();
+            let indices_where = |is_match: fn(&AgentThreadEntry) -> bool| {
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| is_match(entry))
+                    .map(|(ix, _)| ix)
+                    .collect::<Vec<_>>()
+            };
+            (
+                indices_where(|entry| entry.user_message().is_some()),
+                indices_where(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_))),
+            )
+        })
+    }
+
+    #[gpui::test]
+    async fn test_fork_after_a_reply_continues_from_that_reply(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection =
+            StubAgentConnection::new().with_supports_fork(ForkGranularity::AnyUserMessage);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let (prompt_indices, reply_indices) = send_two_turns(&conversation_view, &connection, cx);
+        assert_eq!(reply_indices.len(), 2);
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(view.can_fork_before_user_message(prompt_indices[0], cx));
+            assert!(view.can_fork_before_user_message(prompt_indices[1], cx));
+            assert_eq!(
+                view.fork_point_after_reply(reply_indices[0], cx),
+                Some(ForkPoint::BeforeUserMessage {
+                    entry_ix: prompt_indices[1],
+                    draft_message: false,
+                })
+            );
+            assert_eq!(
+                view.fork_point_after_reply(reply_indices[1], cx),
+                Some(ForkPoint::WholeThread)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agents_that_cut_after_replies_skip_the_first_message(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection =
+            StubAgentConnection::new().with_supports_fork(ForkGranularity::AfterReplies);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let (prompt_indices, reply_indices) = send_two_turns(&conversation_view, &connection, cx);
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(
+                !view.can_fork_before_user_message(prompt_indices[0], cx),
+                "no reply precedes the first message, so there is nothing to cut after"
+            );
+            assert!(view.can_fork_before_user_message(prompt_indices[1], cx));
+            assert_eq!(
+                view.fork_point_after_reply(reply_indices[0], cx),
+                Some(ForkPoint::BeforeUserMessage {
+                    entry_ix: prompt_indices[1],
+                    draft_message: false,
+                })
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_whole_thread_only_agents_fork_only_from_the_last_reply(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection =
+            StubAgentConnection::new().with_supports_fork(ForkGranularity::WholeThread);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let (prompt_indices, reply_indices) = send_two_turns(&conversation_view, &connection, cx);
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(view.can_fork(cx));
+            assert!(
+                !view.can_fork_before_user_message(prompt_indices[1], cx),
+                "user messages must not offer fork when the agent cannot cut at a message"
+            );
+            assert_eq!(view.fork_point_after_reply(reply_indices[0], cx), None);
+            assert_eq!(
+                view.fork_point_after_reply(reply_indices[1], cx),
+                Some(ForkPoint::WholeThread)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_fork_from_message_requests_a_fork_before_that_message(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection =
+            StubAgentConnection::new().with_supports_fork(ForkGranularity::AnyUserMessage);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+        let (session_id, message_ix) =
+            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+                let thread = view.thread.read(cx);
+                let message_ix = thread
+                    .entries()
+                    .iter()
+                    .position(|entry| entry.user_message().is_some())
+                    .expect("the sent message should be in the transcript");
+                (thread.session_id().clone(), message_ix)
+            });
+        connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        let point = ForkPoint::BeforeUserMessage {
+            entry_ix: message_ix,
+            draft_message: true,
+        };
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.fork(point.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.fork_requests(),
+            vec![acp_thread::StubForkRequest { session_id, point }]
+        );
+        // This workspace has no agent panel, so the saved fork cannot be opened and the user
+        // must be told rather than seeing nothing happen.
+        active_thread(&conversation_view, cx).read_with(cx, |view, _| {
+            let Some(ThreadError::Other { message, .. }) = &view.thread_error else {
+                panic!("expected a missing-panel error, found none or another kind");
+            };
+            assert!(
+                message.contains("agent panel is not available"),
+                "unexpected error: {message}"
+            );
+        });
     }
 
     #[gpui::test]

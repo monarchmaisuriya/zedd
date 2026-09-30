@@ -223,6 +223,10 @@ pub trait AgentConnection {
         None
     }
 
+    fn fork(&self, _session_id: &acp_v1::SessionId, _cx: &App) -> Option<Rc<dyn AgentSessionFork>> {
+        None
+    }
+
     fn set_title(
         &self,
         _session_id: &acp_v1::SessionId,
@@ -277,6 +281,46 @@ impl dyn AgentConnection {
 
 pub trait AgentSessionTruncate {
     fn run(&self, client_user_message_id: ClientUserMessageId, cx: &mut App) -> Task<Result<()>>;
+}
+
+pub trait AgentSessionFork {
+    /// Which [`ForkPoint`]s `run` accepts.
+    fn granularity(&self) -> ForkGranularity;
+
+    /// Creates a new session holding this session's history up to `point`. The original
+    /// session is not modified.
+    fn run(&self, point: ForkPoint, cx: &mut App) -> Task<Result<ForkedSession>>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkGranularity {
+    /// Only [`ForkPoint::WholeThread`].
+    WholeThread,
+    /// [`ForkPoint::BeforeUserMessage`] only when an agent reply precedes that message, because
+    /// the agent can cut only right after a reply.
+    AfterReplies,
+    /// [`ForkPoint::BeforeUserMessage`] for any user message.
+    AnyUserMessage,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ForkPoint {
+    /// Every entry, with an empty editor.
+    WholeThread,
+    /// Every entry before the user message at `entry_ix` in [`AcpThread::entries`]. With
+    /// `draft_message`, that message's content is put in the editor to edit and resend; without
+    /// it the editor is empty, continuing from the reply that preceded the message.
+    BeforeUserMessage {
+        entry_ix: usize,
+        draft_message: bool,
+    },
+}
+
+pub struct ForkedSession {
+    pub session_id: acp_v1::SessionId,
+    pub title: SharedString,
+    /// Content to put in the new thread's editor, for agents whose fork cannot store a draft.
+    pub draft_prompt: Option<Vec<acp_v1::ContentBlock>>,
 }
 
 pub trait AgentSessionClientUserMessageIds {
@@ -768,6 +812,9 @@ mod test_support {
         permission_requests: HashMap<acp_v1::ToolCallId, PermissionOptions>,
         next_prompt_updates: Arc<Mutex<Vec<acp_v1::SessionUpdate>>>,
         next_truncate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        /// Forks requested through this connection; `None` when fork is unsupported.
+        fork_requests: Option<Arc<Mutex<Vec<StubForkRequest>>>>,
+        fork_granularity: ForkGranularity,
         supports_load_session: bool,
         supports_session_additional_directories: bool,
         agent_id: AgentId,
@@ -790,6 +837,8 @@ mod test_support {
             Self {
                 next_prompt_updates: Default::default(),
                 next_truncate: Default::default(),
+                fork_requests: None,
+                fork_granularity: ForkGranularity::WholeThread,
                 permission_requests: HashMap::default(),
                 sessions: Arc::default(),
                 supports_load_session: false,
@@ -828,6 +877,19 @@ mod test_support {
         ) -> Self {
             self.supports_session_additional_directories = supports_session_additional_directories;
             self
+        }
+
+        pub fn with_supports_fork(mut self, granularity: ForkGranularity) -> Self {
+            self.fork_requests = Some(Arc::default());
+            self.fork_granularity = granularity;
+            self
+        }
+
+        pub fn fork_requests(&self) -> Vec<StubForkRequest> {
+            self.fork_requests
+                .as_ref()
+                .map(|requests| requests.lock().clone())
+                .unwrap_or_default()
         }
 
         pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
@@ -1074,6 +1136,19 @@ mod test_support {
             }))
         }
 
+        fn fork(
+            &self,
+            session_id: &acp_v1::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn AgentSessionFork>> {
+            let requests = self.fork_requests.clone()?;
+            Some(Rc::new(StubAgentSessionFork {
+                requests,
+                session_id: session_id.clone(),
+                granularity: self.fork_granularity,
+            }))
+        }
+
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
@@ -1099,6 +1174,36 @@ mod test_support {
             cx: &mut App,
         ) -> Task<Result<acp_v1::PromptResponse>> {
             self.connection.prompt(params, cx)
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct StubForkRequest {
+        pub session_id: acp_v1::SessionId,
+        pub point: ForkPoint,
+    }
+
+    struct StubAgentSessionFork {
+        requests: Arc<Mutex<Vec<StubForkRequest>>>,
+        session_id: acp_v1::SessionId,
+        granularity: ForkGranularity,
+    }
+
+    impl AgentSessionFork for StubAgentSessionFork {
+        fn granularity(&self) -> ForkGranularity {
+            self.granularity
+        }
+
+        fn run(&self, point: ForkPoint, _cx: &mut App) -> Task<Result<ForkedSession>> {
+            self.requests.lock().push(StubForkRequest {
+                session_id: self.session_id.clone(),
+                point,
+            });
+            Task::ready(Ok(ForkedSession {
+                session_id: acp_v1::SessionId::new(format!("{}-fork", self.session_id)),
+                title: SharedString::default(),
+                draft_prompt: None,
+            }))
         }
     }
 
