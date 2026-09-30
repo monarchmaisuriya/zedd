@@ -996,6 +996,40 @@ fn test_combined_injection_with_leading_content_layer_ordering(cx: &mut App) {
 }
 
 #[gpui::test]
+fn test_injections_sharing_a_start_are_ordered_by_descending_end(cx: &mut App) {
+    // Inline HTML is a combined injection whose layer spans the whole inline node, so a
+    // paragraph that starts with `$...$` math yields an HTML layer and a LaTeX layer that
+    // begin at the same byte. The parse queue and the layer tree both put the wider layer
+    // first; the debug invariant check must accept that order.
+    let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+    let markdown = markdown_lang();
+    registry.add(markdown.clone());
+    registry.add(crate::test_language(
+        "markdown-inline",
+        tree_sitter_md::INLINE_LANGUAGE.into(),
+    ));
+    registry.add(Arc::new(html_lang()));
+    // LaTeX is intentionally not registered, so its layer stays pending, as in a default install.
+
+    let text = "Intro\n\n$x^2$ and <b>bold</b> text\n";
+    let buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        text.to_string(),
+    );
+    let mut syntax_map = SyntaxMap::new(&buffer);
+    syntax_map.set_language_registry(registry);
+    syntax_map.reparse(markdown, &buffer);
+
+    let math_paragraph = text.find('$').unwrap()..text.len();
+    let layer_languages = syntax_map
+        .layers_for_range(math_paragraph, &buffer, true)
+        .map(|layer| layer.language.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(layer_languages, ["Markdown", "Markdown-Inline", "HTML"]);
+}
+
+#[gpui::test]
 fn test_comment_triggered_injection_toggle(cx: &mut App) {
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
 
