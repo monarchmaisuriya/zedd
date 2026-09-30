@@ -258,8 +258,6 @@ dependencies = [
  "chrono",
  "client",
  "clock",
- "cloud_api_types",
- "cloud_llm_client",
  "collections",
  "context_server",
  "ctor",
@@ -319,7 +317,6 @@ dependencies = [
  "util",
  "uuid",
  "watch",
- "web_search",
  "zed_env_vars",
  "zlog",
  "zstd 0.11.2+zstd.1.5.2",
@@ -9745,9 +9742,6 @@ dependencies = [
  "bedrock",
  "client",
  "clock",
- "cloud_api_client",
- "cloud_api_types",
- "cloud_llm_client",
  "collections",
  "component",
  "convert_case 0.11.0",
@@ -9767,7 +9761,6 @@ dependencies = [
  "http_client",
  "language",
  "language_model",
- "language_models_cloud",
  "llama_cpp",
  "lmstudio",
  "log",
@@ -9793,28 +9786,6 @@ dependencies = [
  "util",
  "x_ai",
  "x_ai_subscribed",
-]
-
-[[package]]
-name = "language_models_cloud"
-version = "0.1.0"
-dependencies = [
- "anthropic",
- "anyhow",
- "cloud_api_client",
- "cloud_llm_client",
- "futures 0.3.34",
- "google_ai",
- "gpui",
- "http_client",
- "language_model",
- "log",
- "open_ai",
- "schemars 1.0.4",
- "semver",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -20801,33 +20772,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "web_search"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cloud_llm_client",
- "collections",
- "gpui",
-]
-
-[[package]]
-name = "web_search_providers"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "client",
- "cloud_api_client",
- "cloud_api_types",
- "cloud_llm_client",
- "futures 0.3.34",
- "gpui",
- "http_client",
- "language_model",
- "serde_json",
- "web_search",
-]
-
-[[package]]
 name = "webpki-root-certs"
 version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22936,8 +22880,6 @@ dependencies = [
  "vim",
  "vim_mode_setting",
  "watch",
- "web_search",
- "web_search_providers",
  "which_key",
  "windows 0.62.2",
  "windows_resources",

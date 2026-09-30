@@ -1,10 +1,8 @@
 use super::{Client, Status, TypedEnvelope, proto};
 use anyhow::{Context as _, Result};
-use chrono::{DateTime, Utc};
 use cloud_api_client::websocket_protocol::MessageToClient;
 use cloud_api_client::{
-    GetAuthenticatedUserResponse, KnownOrUnknown, Organization, OrganizationId, Plan, PlanInfo,
-    UpdateSystemSettingsBody,
+    GetAuthenticatedUserResponse, Organization, OrganizationId, UpdateSystemSettingsBody,
 };
 use cloud_api_types::OrganizationConfiguration;
 use cloud_llm_client::{
@@ -111,11 +109,9 @@ pub struct UserStore {
     participant_indices: HashMap<u64, ParticipantIndex>,
     update_contacts_tx: mpsc::UnboundedSender<UpdateContacts>,
     edit_prediction_usage: Option<EditPredictionUsage>,
-    plan_info: Option<PlanInfo>,
     current_user: watch::Receiver<Option<Arc<User>>>,
     current_organization: Option<Arc<Organization>>,
     organizations: Vec<Arc<Organization>>,
-    plans_by_organization: HashMap<OrganizationId, Plan>,
     configuration_by_organization: HashMap<OrganizationId, OrganizationConfiguration>,
     contacts: Vec<Arc<Contact>>,
     incoming_contact_requests: Vec<Arc<User>>,
@@ -142,7 +138,6 @@ pub enum Event {
     ShowContacts,
     ParticipantIndicesChanged,
     PrivateUserInfoUpdated,
-    PlanUpdated,
     OrganizationChanged,
 }
 
@@ -191,9 +186,7 @@ impl UserStore {
             current_user: current_user_rx,
             current_organization: None,
             organizations: Vec::new(),
-            plans_by_organization: HashMap::default(),
             configuration_by_organization: HashMap::default(),
-            plan_info: None,
             edit_prediction_usage: None,
             contacts: Default::default(),
             incoming_contact_requests: Default::default(),
@@ -273,7 +266,7 @@ impl UserStore {
                             current_user_tx.send(None).await.ok();
                             this.update(cx, |this, cx| {
                                 this.clear_organizations();
-                                this.clear_plan_and_usage();
+                                this.clear_edit_prediction_usage();
                                 cx.emit(Event::PrivateUserInfoUpdated);
                                 cx.notify();
                                 this.clear_contacts()
@@ -736,10 +729,6 @@ impl UserStore {
         &self.organizations
     }
 
-    pub fn plan_for_organization(&self, organization_id: &OrganizationId) -> Option<Plan> {
-        self.plans_by_organization.get(organization_id).copied()
-    }
-
     pub fn current_organization_configuration(&self) -> Option<&OrganizationConfiguration> {
         let current_organization = self.current_organization.as_ref()?;
 
@@ -762,72 +751,6 @@ impl UserStore {
         cx.notify();
     }
 
-    pub fn plan(&self) -> Option<Plan> {
-        #[cfg(debug_assertions)]
-        if let Ok(plan) = std::env::var("ZED_SIMULATE_PLAN").as_ref() {
-            use cloud_api_client::Plan;
-
-            return match plan.as_str() {
-                "free" => Some(Plan::ZedFree),
-                "trial" => Some(Plan::ZedProTrial),
-                "pro" => Some(Plan::ZedPro),
-                _ => {
-                    panic!("ZED_SIMULATE_PLAN must be one of 'free', 'trial', or 'pro'");
-                }
-            };
-        }
-
-        if let Some(organization) = &self.current_organization {
-            return self.plan_for_organization(&organization.id);
-        }
-
-        self.plan_info.as_ref().map(|info| info.plan())
-    }
-
-    pub fn subscription_period(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-        self.plan_info
-            .as_ref()
-            .and_then(|plan| plan.subscription_period)
-            .map(|subscription_period| {
-                (
-                    subscription_period.started_at.0,
-                    subscription_period.ended_at.0,
-                )
-            })
-    }
-
-    pub fn trial_started_at(&self) -> Option<DateTime<Utc>> {
-        self.plan_info
-            .as_ref()
-            .and_then(|plan| plan.trial_started_at)
-            .map(|trial_started_at| trial_started_at.0)
-    }
-
-    /// Returns whether the user's account is too new to use the service.
-    ///
-    /// This only applies when operating under the user's personal organization,
-    /// not a business organization.
-    pub fn account_too_young(&self) -> bool {
-        if let Some(org) = &self.current_organization {
-            if !org.is_personal {
-                return false;
-            }
-        }
-
-        self.plan_info
-            .as_ref()
-            .map(|plan| plan.is_account_too_young)
-            .unwrap_or_default()
-    }
-
-    /// Returns whether the current user has overdue invoices and usage should be blocked.
-    pub fn has_overdue_invoices(&self) -> bool {
-        self.plan_info
-            .as_ref()
-            .map(|plan| plan.has_overdue_invoices)
-            .unwrap_or_default()
-    }
-
     pub fn edit_prediction_usage(&self) -> Option<EditPredictionUsage> {
         self.edit_prediction_usage
     }
@@ -846,8 +769,7 @@ impl UserStore {
         self.current_organization = None;
     }
 
-    pub fn clear_plan_and_usage(&mut self) {
-        self.plan_info = None;
+    pub fn clear_edit_prediction_usage(&mut self) {
         self.edit_prediction_usage = None;
     }
 
@@ -875,21 +797,6 @@ impl UserStore {
                     .cloned()
             })
             .or_else(|| self.organizations.first().cloned());
-        self.plans_by_organization = response
-            .plans_by_organization
-            .into_iter()
-            .map(|(organization_id, plan)| {
-                let plan = match plan {
-                    KnownOrUnknown::Known(plan) => plan,
-                    KnownOrUnknown::Unknown(_) => {
-                        // If we get a plan that we don't recognize, fall back to the Free plan.
-                        Plan::ZedFree
-                    }
-                };
-
-                (organization_id, plan)
-            })
-            .collect();
         self.configuration_by_organization =
             response.configuration_by_organization.into_iter().collect();
 
@@ -897,7 +804,6 @@ impl UserStore {
             limit: response.plan.usage.edit_predictions.limit,
             amount: response.plan.usage.edit_predictions.used as i32,
         }));
-        self.plan_info = Some(response.plan);
         cx.emit(Event::PrivateUserInfoUpdated);
     }
 

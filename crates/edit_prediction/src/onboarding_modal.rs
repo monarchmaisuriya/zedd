@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{EditPredictionStore, ZedPredictUpsell};
 use ai_onboarding::EditPredictionOnboarding;
-use client::{Client, UserStore};
+use client::Client;
 use db::kvp::Dismissable;
 use fs::Fs;
 use gpui::{
@@ -45,7 +45,6 @@ pub(crate) fn set_edit_prediction_provider(provider: EditPredictionProvider, cx:
 impl ZedPredictModal {
     pub fn toggle(
         workspace: &mut Workspace,
-        user_store: Entity<UserStore>,
         client: Arc<Client>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -58,7 +57,6 @@ impl ZedPredictModal {
             Self {
                 onboarding: cx.new(|cx| {
                     EditPredictionOnboarding::new(
-                        user_store.clone(),
                         client.clone(),
                         copilot
                             .as_ref()

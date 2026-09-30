@@ -1,12 +1,10 @@
 mod application_menu;
 pub mod collab;
 mod onboarding_banner;
-mod plan_chip;
 mod title_bar_settings;
 mod update_version;
 
 use crate::application_menu::{ApplicationMenu, show_menus};
-use crate::plan_chip::PlanChip;
 use agent_settings::{AgentSettings, WindowLayout};
 use arrayvec::ArrayVec;
 use git_ui_core::worktree_picker::WorktreePicker;
@@ -1231,15 +1229,7 @@ impl TitleBar {
         let business_organization = current_organization
             .as_ref()
             .filter(|organization| !organization.is_personal);
-        let organizations: Vec<_> = user_store
-            .read(cx)
-            .organizations()
-            .iter()
-            .map(|organization| {
-                let plan = user_store.read(cx).plan_for_organization(&organization.id);
-                (organization.clone(), plan)
-            })
-            .collect();
+        let organizations: Vec<_> = user_store.read(cx).organizations().iter().cloned().collect();
 
         let show_user_picture = TitleBarSettings::get_global(cx).show_user_picture;
 
@@ -1334,9 +1324,8 @@ impl TitleBar {
                     .when(is_signed_in, |this| {
                         let mut this = this.header("Organization");
 
-                        for (organization, plan) in &organizations {
+                        for organization in &organizations {
                             let organization = organization.clone();
-                            let plan = *plan;
 
                             let is_current =
                                 current_organization
@@ -1364,7 +1353,6 @@ impl TitleBar {
                                                         )
                                                     }),
                                             )
-                                            .children(plan.map(|plan| PlanChip::new(plan)))
                                             .into_any_element()
                                     }
                                 },
