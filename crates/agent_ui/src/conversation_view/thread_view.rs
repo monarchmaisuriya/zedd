@@ -578,6 +578,21 @@ struct ToolOutputPreview {
 /// Lines of a long terminal command shown while it is collapsed.
 const COLLAPSED_COMMAND_LINES: usize = 2;
 
+/// How much of the main text color secondary transcript text keeps over the panel background.
+const SECONDARY_TEXT_OPACITY: f32 = 0.7;
+
+/// Transcript text that is not the agent's reply: tool lines, notices, thinking, tool output.
+/// Blended from the main text color, not the theme's muted color, so it stays dimmer than
+/// the reply even in themes whose muted text equals their main text.
+fn secondary_text_color(cx: &App) -> Hsla {
+    let colors = cx.theme().colors();
+    secondary_text_blend(colors.text, colors.panel_background)
+}
+
+fn secondary_text_blend(text: Hsla, background: Hsla) -> Hsla {
+    background.blend(text.opacity(SECONDARY_TEXT_OPACITY))
+}
+
 fn transcript_view_label(transcript_view: TranscriptView) -> &'static str {
     match transcript_view {
         TranscriptView::Normal => "Normal",
@@ -7701,7 +7716,7 @@ impl ThreadView {
                             .child(
                                 div()
                                     .text_size(self.tool_name_font_size())
-                                    .text_color(cx.theme().colors().text_muted)
+                                    .text_color(secondary_text_color(cx))
                                     .child("Thinking"),
                             ),
                     )
@@ -7728,6 +7743,7 @@ impl ThreadView {
                         .child(
                             div()
                                 .id(("thinking-content", chunk_ix))
+                                .text_color(secondary_text_color(cx))
                                 .ml_1p5()
                                 .pl_3p5()
                                 .border_l_1()
@@ -8560,7 +8576,7 @@ impl ThreadView {
         let line = |text: SharedString| {
             Label::new(text)
                 .size(LabelSize::Custom(self.tool_name_font_size()))
-                .color(Color::Muted)
+                .color(Color::Custom(secondary_text_color(cx)))
                 .truncate()
         };
         match message.injected_turn() {
@@ -8600,7 +8616,7 @@ impl ThreadView {
                                     IconName::ChevronRight
                                 })
                                 .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                                .color(Color::Custom(secondary_text_color(cx))),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.entry_view_state.update(cx, |state, _| {
@@ -8621,6 +8637,7 @@ impl ThreadView {
                                 .border_l_1()
                                 .border_color(self.tool_card_border_color(cx))
                                 .text_ui(cx)
+                                .text_color(secondary_text_color(cx))
                                 .debug_selector(move || format!("subagent-report-body-{entry_ix}"))
                                 .child(self.render_message_content(
                                     entry_ix,
@@ -8702,7 +8719,7 @@ impl ThreadView {
                 .child(
                     Label::new(text)
                         .size(LabelSize::Custom(self.tool_name_font_size()))
-                        .color(Color::Muted)
+                        .color(Color::Custom(secondary_text_color(cx)))
                         .truncate(),
                 )
                 .when_some(line_counts, |this, (added, removed)| {
@@ -8726,7 +8743,7 @@ impl ThreadView {
                         IconName::ChevronRight
                     })
                     .size(IconSize::XSmall)
-                    .color(Color::Muted),
+                    .color(Color::Custom(secondary_text_color(cx))),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.entry_view_state.update(cx, |state, _| {
@@ -8777,7 +8794,7 @@ impl ThreadView {
         let color = if Self::tool_call_failed(tool_call) {
             Color::Error
         } else {
-            Color::Muted
+            Color::Custom(secondary_text_color(cx))
         };
         let tool_call_id = tool_call.id.clone();
 
@@ -8815,7 +8832,7 @@ impl ThreadView {
                             IconName::ChevronRight
                         })
                         .size(IconSize::XSmall)
-                        .color(Color::Muted),
+                        .color(Color::Custom(secondary_text_color(cx))),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.entry_view_state.update(cx, |state, _| {
@@ -10950,13 +10967,7 @@ impl ThreadView {
                 h_flex()
                     .id(("open-tool-call-location", entry_ix))
                     .w_full()
-                    .map(|this| {
-                        if use_card_layout {
-                            this.text_color(cx.theme().colors().text)
-                        } else {
-                            this.text_color(cx.theme().colors().text_muted)
-                        }
-                    })
+                    .text_color(secondary_text_color(cx))
                     .child(
                         self.render_markdown(
                             tool_call.label.clone(),
@@ -11422,7 +11433,7 @@ impl ThreadView {
                 }
             })
             .text_xs()
-            .text_color(cx.theme().colors().text_muted)
+            .text_color(secondary_text_color(cx))
             .child(
                 div()
                     .relative()
@@ -13862,6 +13873,25 @@ mod tests {
     use std::path::Path;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_secondary_text_sits_between_text_and_background() {
+        // A dark theme whose muted text equals its text, and a light theme.
+        for (text, background) in [(0xcccccc, 0x181818), (0x242529, 0xfafafa)] {
+            let text = Hsla::from(gpui::rgb(text));
+            let background = Hsla::from(gpui::rgb(background));
+            let secondary = secondary_text_blend(text, background);
+            let (low, high) = if text.l < background.l {
+                (text.l, background.l)
+            } else {
+                (background.l, text.l)
+            };
+            assert!(
+                low < secondary.l && secondary.l < high,
+                "secondary {secondary:?} not between {text:?} and {background:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_tool_call_icon_tooltip() {
