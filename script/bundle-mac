@@ -196,8 +196,14 @@ function sign_app_binaries() {
     rm -rf "${app_path}/Contents/Frameworks"
     mkdir -p "${app_path}/Contents/Frameworks"
 
-    echo "Downloading git binary"
-    download_git "${target_triple}" "${app_path}/Contents/MacOS/git"
+    # Opt-in for machines that cannot reach GitHub's release downloads. Without a bundled
+    # git the app uses the system git, which it already prefers when one is installed.
+    if [[ -n "${ZEDD_SKIP_BUNDLED_GIT:-}" ]]; then
+        echo "ZEDD_SKIP_BUNDLED_GIT is set: not bundling git; the app will use the system git"
+    else
+        echo "Downloading git binary"
+        download_git "${target_triple}" "${app_path}/Contents/MacOS/git"
+    fi
 
     # Note: The app identifier for our development builds is the same as the app identifier for nightly.
     cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
@@ -206,7 +212,9 @@ function sign_app_binaries() {
         echo "Code signing binaries"
         # sequence of codesign commands modeled after this example: https://developer.apple.com/forums/thread/701514
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/cli" -v
-        /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/git" -v
+        if [[ -f "${app_path}/Contents/MacOS/git" ]]; then
+            /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/git" -v
+        fi
         /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/zed" -v
         /usr/bin/codesign --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}" -v
     else
