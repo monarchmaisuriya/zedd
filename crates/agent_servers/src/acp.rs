@@ -33,7 +33,10 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::{any::Any, cell::RefCell};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+};
 use task::SpawnInTerminal;
 use thiserror::Error;
 use util::ResultExt as _;
@@ -112,6 +115,9 @@ struct ClientContext {
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
     request_elicitations: Entity<ElicitationStore>,
+    /// Set once the agent identifies as the Claude ACP adapter; see
+    /// [`is_injected_claude_user_turn`].
+    drops_injected_user_turns: Rc<Cell<bool>>,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -709,6 +715,7 @@ impl AcpConnection {
 
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
+        let drops_injected_user_turns = Rc::new(Cell::new(false));
         let request_elicitations = cx.new(|_| ElicitationStore::default());
 
         // Set up the foreground dispatch channel for bridging Send handler
@@ -761,6 +768,7 @@ impl AcpConnection {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            drops_injected_user_turns: drops_injected_user_turns.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -857,6 +865,7 @@ impl AcpConnection {
         let reads_air_fork_points = agent_info
             .as_ref()
             .is_some_and(|info| info.name == CLAUDE_AGENT_ACP_NAME);
+        drops_injected_user_turns.set(reads_air_fork_points);
         let telemetry_id = agent_info
             .as_ref()
             // Use the one the agent provides if we have one
@@ -2507,6 +2516,7 @@ pub mod test_support {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            drops_injected_user_turns: Rc::default(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -2644,6 +2654,26 @@ mod tests {
     use super::*;
     use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _};
     use settings::Settings as _;
+
+    #[test]
+    fn test_injected_claude_user_turns_are_recognized_by_framing() {
+        let user_turn =
+            |text: &str| acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(text.into()));
+        assert!(is_injected_claude_user_turn(&user_turn(
+            "Another Claude session sent a message:\n<agent-message from=\"a1\">report"
+        )));
+        assert!(is_injected_claude_user_turn(&user_turn(
+            "<task-notification>\n<task-id>a1</task-id>\n</task-notification>"
+        )));
+        assert!(!is_injected_claude_user_turn(&user_turn(
+            "why did the <task-notification> show up?"
+        )));
+        assert!(!is_injected_claude_user_turn(
+            &acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                "<task-notification> is how background agents report".into()
+            ))
+        ));
+    }
 
     fn init_feature_flags_test(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -4293,6 +4323,7 @@ exit 7
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            drops_injected_user_turns: Rc::default(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -5199,6 +5230,29 @@ fn config_state(
     (modes, None)
 }
 
+/// Labeled stopgap. The Claude ACP adapter's history replay sends turns its harness injected
+/// (a subagent's hand-back, a task notification) as user messages, though its live prompt
+/// loop never sends them, so a reloaded thread shows them as if the user had typed them:
+/// https://github.com/agentclientprotocol/claude-agent-acp/issues/1203. The replay carries
+/// no marker, so they are recognized by their framing. Remove once the Zed registry ships
+/// an adapter that skips them on replay.
+fn is_injected_claude_user_turn(update: &acp::SessionUpdate) -> bool {
+    const INJECTED_TURN_PREFIXES: [&str; 2] = [
+        "Another Claude session sent a message:",
+        "<task-notification>",
+    ];
+    let acp::SessionUpdate::UserMessageChunk(chunk) = update else {
+        return false;
+    };
+    let acp::ContentBlock::Text(text) = &chunk.content else {
+        return false;
+    };
+    let text = text.text.trim_start();
+    INJECTED_TURN_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
 /// The `agentInfo.name` of the Claude ACP adapter, which reads fork points from
 /// `_meta.jetbrains.air.fork`.
 const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
@@ -5752,6 +5806,10 @@ fn handle_session_notification(
     let Some(_thread) = thread.upgrade() else {
         return;
     };
+
+    if ctx.drops_injected_user_turns.get() && is_injected_claude_user_turn(&notification.update) {
+        return;
+    }
 
     // Pre-handle: if a ToolCall carries terminal_info, create/register a display-only terminal.
     if let acp::SessionUpdate::ToolCall(tc) = &notification.update {
