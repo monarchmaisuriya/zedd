@@ -853,6 +853,7 @@ impl ConversationView {
         let mut subscriptions = vec![
             cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<SettingsStore>(window, Self::invalidate_mermaid_caches),
+            cx.observe_global_in::<SettingsStore>(window, Self::apply_terminal_preview_limits),
             cx.observe_global_in::<AgentUiFontSize>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<AgentBufferFontSize>(window, Self::agent_ui_font_size_changed),
             cx.subscribe_in(
@@ -3189,6 +3190,18 @@ impl ConversationView {
         {
             entry_view_state.update(cx, |entry_view_state, cx| {
                 entry_view_state.agent_ui_font_size_changed(cx);
+            });
+        }
+    }
+
+    fn apply_terminal_preview_limits(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(connected) = self.as_connected() else {
+            return;
+        };
+        let thread_views = connected.threads.values().cloned().collect::<Vec<_>>();
+        for thread_view in thread_views {
+            thread_view.update(cx, |thread_view, cx| {
+                thread_view.apply_terminal_preview_limits(cx)
             });
         }
     }
@@ -8631,6 +8644,418 @@ pub(crate) mod tests {
                 assert_eq!(copied.as_deref(), Some(expected));
             }
         }
+    }
+
+    #[gpui::test]
+    async fn test_code_blocks_in_tool_output_follow_expand_code_block(cx: &mut TestAppContext) {
+        init_test(cx);
+        let tool_call_id = acp_v1::ToolCallId::new("code-tool-output");
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new(tool_call_id.clone(), "Show code")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::Completed)
+                .content(vec!["```rust\nfn main() {}\n```".into()]),
+        )]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Run the tool", cx))
+            .await
+            .unwrap();
+        active_thread(&conversation_view, cx).update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _| {
+                state.expand_tool_call(tool_call_id.clone());
+            });
+        });
+
+        for expand_code_block in [false, true] {
+            cx.update(|_, cx| {
+                AgentSettings::override_global(
+                    AgentSettings {
+                        expand_code_block,
+                        ..AgentSettings::get_global(cx).clone()
+                    },
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                cx.debug_bounds("collapsed-code-block").is_some(),
+                !expand_code_block,
+                "tool output code block collapsed state with expand_code_block = {expand_code_block}"
+            );
+        }
+    }
+
+    /// Opens a thread whose one tool call printed `output`, with `tool_output_preview_lines`
+    /// set to `preview_lines` and the tool card open.
+    async fn setup_tool_output<'a>(
+        output: &str,
+        preview_lines: usize,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<ConversationView>, &'a mut VisualTestContext) {
+        init_test(cx);
+        let tool_call_id = acp_v1::ToolCallId::new("long-tool-output");
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new(tool_call_id.clone(), "Print lines")
+                .kind(acp_v1::ToolKind::Other)
+                .status(acp_v1::ToolCallStatus::Completed)
+                .content(vec![output.into()]),
+        )]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    tool_output_preview_lines: preview_lines,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Run the tool", cx))
+            .await
+            .unwrap();
+        active_thread(&conversation_view, cx).update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _| {
+                state.expand_tool_call(tool_call_id);
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (conversation_view, cx)
+    }
+
+    /// Opens a thread with one finished terminal tool call that ran `command`, with
+    /// `tool_output_preview_lines` set to 3 and the card open.
+    async fn setup_terminal_command<'a>(
+        command: &str,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<AcpThread>,
+        acp_v1::ToolCallId,
+        &'a mut VisualTestContext,
+    ) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    tool_output_preview_lines: 3,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let terminal_id = acp_v1::TerminalId::new("command-terminal");
+        let tool_call_id = acp_v1::ToolCallId::new("command-tool");
+        let terminal = cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                Default::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                acp_thread::TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: command.into(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal,
+                },
+                cx,
+            );
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new(tool_call_id.clone(), command)
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::Completed)
+                            .content(vec![acp_v1::ToolCallContent::Terminal(
+                                acp_v1::Terminal::new(terminal_id),
+                            )]),
+                    ),
+                    cx,
+                )
+                .expect("terminal tool call");
+        });
+        thread_view.update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _| {
+                state.expand_tool_call(tool_call_id.clone());
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (thread, tool_call_id, cx)
+    }
+
+    #[gpui::test]
+    async fn test_long_terminal_command_is_collapsed_until_expanded(cx: &mut TestAppContext) {
+        let (_thread, _tool_call_id, cx) = setup_terminal_command(&numbered_lines(6), cx).await;
+        let collapsed = cx
+            .debug_bounds("collapsed-command")
+            .expect("a command taller than two lines is collapsed");
+        cx.simulate_click(collapsed.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("collapsed-command").is_none(),
+            "clicking the collapsed command shows it in full"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_two_line_terminal_command_is_not_collapsed(cx: &mut TestAppContext) {
+        // Fenced, so the code block's own spacing must not count as extra lines.
+        let (_thread, _tool_call_id, cx) =
+            setup_terminal_command("```\ncargo build\ncargo test\n```", cx).await;
+        assert!(cx.debug_bounds("collapsed-command").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_terminal_command_awaiting_permission_is_never_collapsed(cx: &mut TestAppContext) {
+        let (thread, tool_call_id, cx) = setup_terminal_command(&numbered_lines(6), cx).await;
+        assert!(cx.debug_bounds("collapsed-command").is_some());
+        let _authorization = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp_v1::ToolCallUpdate::new(
+                        tool_call_id.clone(),
+                        acp_v1::ToolCallUpdateFields::new(),
+                    ),
+                    PermissionOptions::Flat(vec![acp_v1::PermissionOption::new(
+                        "allow-command",
+                        "Allow",
+                        acp_v1::PermissionOptionKind::AllowOnce,
+                    )]),
+                    acp_thread::AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .expect("authorization request");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("collapsed-command").is_none(),
+            "a command awaiting permission must be shown in full"
+        );
+    }
+
+    fn numbered_lines(count: usize) -> String {
+        (1..=count)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[gpui::test]
+    async fn test_long_tool_output_is_previewed_until_shown_in_full(cx: &mut TestAppContext) {
+        let (_conversation_view, cx) = setup_tool_output(&numbered_lines(10), 3, cx).await;
+        assert!(cx.debug_bounds("tool-output-preview").is_some());
+        let show_all = cx
+            .debug_bounds("tool-output-show-all")
+            .expect("a clamped output offers Show all");
+
+        cx.simulate_click(show_all.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-output-preview").is_none());
+        let show_less = cx
+            .debug_bounds("tool-output-show-less")
+            .expect("a fully shown output offers Show less");
+
+        cx.simulate_click(show_less.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-output-preview").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_short_tool_output_is_not_previewed(cx: &mut TestAppContext) {
+        let (_conversation_view, cx) = setup_tool_output(&numbered_lines(3), 3, cx).await;
+        assert!(cx.debug_bounds("tool-output-preview").is_none());
+        assert!(cx.debug_bounds("tool-output-show-all").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_tool_output_is_not_previewed_when_the_setting_is_zero(cx: &mut TestAppContext) {
+        let (_conversation_view, cx) = setup_tool_output(&numbered_lines(10), 0, cx).await;
+        assert!(cx.debug_bounds("tool-output-preview").is_none());
+        assert!(cx.debug_bounds("tool-output-show-all").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_active_search_match_shows_previewed_tool_output(cx: &mut TestAppContext) {
+        let output = format!("{}\npapaya", numbered_lines(9));
+        let (conversation_view, cx) = setup_tool_output(&output, 3, cx).await;
+        assert!(cx.debug_bounds("tool-output-preview").is_some());
+
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        cx.run_until_parked();
+        let bar = thread_view
+            .read_with(cx, |view, _| view.thread_search_bar.clone())
+            .expect("thread_search_bar should be set after toggle_search");
+        bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor.update(cx, |editor, cx| {
+                editor.set_text("papaya", window, cx);
+            });
+            bar.update_matches(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(bar.read_with(cx, |bar, _| bar.match_count()), 1);
+        assert!(
+            cx.debug_bounds("tool-output-preview").is_none(),
+            "the output holding the active match must not stay clamped"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_output_is_previewed_until_shown_in_full(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let set_preview_lines = |preview_lines: usize, cx: &mut VisualTestContext| {
+            cx.update(|_, cx| {
+                AgentSettings::override_global(
+                    AgentSettings {
+                        tool_output_preview_lines: preview_lines,
+                        ..AgentSettings::get_global(cx).clone()
+                    },
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+        };
+        set_preview_lines(3, cx);
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let terminal_id = acp_v1::TerminalId::new("preview-terminal");
+        let tool_id = acp_v1::ToolCallId::new("preview-tool");
+        let terminal = cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                Default::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let display_terminal = terminal.clone();
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                acp_thread::TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: "print ten lines".into(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal,
+                },
+                cx,
+            );
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new(tool_id.clone(), "print ten lines")
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::Completed)
+                            .content(vec![acp_v1::ToolCallContent::Terminal(
+                                acp_v1::Terminal::new(terminal_id.clone()),
+                            )]),
+                    ),
+                    cx,
+                )
+                .expect("terminal tool call");
+        });
+        display_terminal.update(cx, |terminal, cx| {
+            let output = (1..=10)
+                .map(|line| format!("line {line}\r\n"))
+                .collect::<String>();
+            terminal.write_output(output.as_bytes(), cx);
+        });
+        let entry_state = thread_view.read_with(cx, |view, _| view.entry_view_state.clone());
+        entry_state.update(cx, |state, cx| {
+            state.expand_tool_call(tool_id.clone());
+            cx.notify();
+        });
+        thread_view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+
+        let acp_terminal = thread.read_with(cx, |thread, _| {
+            thread
+                .terminal(terminal_id.clone())
+                .expect("terminal tool call should contain a terminal")
+        });
+        let terminal_view = entry_state.read_with(cx, |state, _| {
+            state
+                .entry(0)
+                .and_then(|entry| entry.terminal(&acp_terminal))
+                .expect("terminal tool card should contain a terminal view")
+        });
+        let displayed_lines = |cx: &mut VisualTestContext| {
+            cx.update(
+                |window, cx| match terminal_view.read(cx).content_mode(window, cx) {
+                    terminal_view::ContentMode::Inline {
+                        displayed_lines, ..
+                    } => displayed_lines,
+                    terminal_view::ContentMode::Scrollable => usize::MAX,
+                },
+            )
+        };
+        assert_eq!(displayed_lines(cx), 3);
+        assert!(
+            cx.debug_bounds("terminal-output-fade").is_some(),
+            "a cut terminal output fades out at the bottom"
+        );
+
+        let show_all = cx
+            .debug_bounds("tool-output-show-all")
+            .expect("a long terminal output offers Show all");
+        cx.simulate_click(show_all.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(displayed_lines(cx) >= 10, "Show all shows every line");
+        assert!(cx.debug_bounds("terminal-output-fade").is_none());
+
+        let show_less = cx
+            .debug_bounds("tool-output-show-less")
+            .expect("a fully shown terminal offers Show less");
+        cx.simulate_click(show_less.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(displayed_lines(cx), 3);
+
+        set_preview_lines(5, cx);
+        assert_eq!(
+            displayed_lines(cx),
+            5,
+            "an open terminal follows a changed setting"
+        );
+
+        // Ten printed lines fit in a 20-line preview, so there is nothing to toggle.
+        set_preview_lines(20, cx);
+        assert!(cx.debug_bounds("tool-output-show-all").is_none());
+        assert!(cx.debug_bounds("tool-output-show-less").is_none());
     }
 
     #[gpui::test]

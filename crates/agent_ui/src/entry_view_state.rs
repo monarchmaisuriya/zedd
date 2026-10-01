@@ -49,6 +49,12 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
+    /// Tool calls whose output the user chose to show beyond `tool_output_preview_lines`.
+    fully_shown_tool_outputs: HashSet<acp_v1::ToolCallId>,
+    /// Terminal tool calls whose command was taller than its collapsed height when last laid out.
+    overflowing_commands: HashSet<acp_v1::ToolCallId>,
+    /// Terminal tool calls whose collapsed command the user chose to show in full.
+    expanded_commands: HashSet<acp_v1::ToolCallId>,
 }
 
 impl EntryViewState {
@@ -71,6 +77,9 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            fully_shown_tool_outputs: HashSet::default(),
+            overflowing_commands: HashSet::default(),
+            expanded_commands: HashSet::default(),
         }
     }
 
@@ -93,6 +102,43 @@ impl EntryViewState {
     pub(crate) fn toggle_tool_call_expansion(&mut self, tool_call_id: &acp_v1::ToolCallId) {
         if !self.expanded_tool_calls.remove(tool_call_id) {
             self.expanded_tool_calls.insert(tool_call_id.clone());
+        }
+    }
+
+    pub(crate) fn is_tool_output_fully_shown(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.fully_shown_tool_outputs.contains(tool_call_id)
+    }
+
+    pub(crate) fn toggle_tool_output_fully_shown(&mut self, tool_call_id: &acp_v1::ToolCallId) {
+        if !self.fully_shown_tool_outputs.remove(tool_call_id) {
+            self.fully_shown_tool_outputs.insert(tool_call_id.clone());
+        }
+    }
+
+    pub(crate) fn command_overflows(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.overflowing_commands.contains(tool_call_id)
+    }
+
+    /// Returns whether the recorded state changed.
+    pub(crate) fn set_command_overflows(
+        &mut self,
+        tool_call_id: &acp_v1::ToolCallId,
+        overflows: bool,
+    ) -> bool {
+        if overflows {
+            self.overflowing_commands.insert(tool_call_id.clone())
+        } else {
+            self.overflowing_commands.remove(tool_call_id)
+        }
+    }
+
+    pub(crate) fn is_command_expanded(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.expanded_commands.contains(tool_call_id)
+    }
+
+    pub(crate) fn toggle_command_expanded(&mut self, tool_call_id: &acp_v1::ToolCallId) {
+        if !self.expanded_commands.remove(tool_call_id) {
+            self.expanded_commands.insert(tool_call_id.clone());
         }
     }
 
@@ -706,6 +752,19 @@ impl Focusable for Entry {
     }
 }
 
+/// Most lines an embedded terminal shows before it becomes a scroll box.
+const EMBEDDED_TERMINAL_MAX_LINES: usize = 1000;
+
+/// Lines an embedded terminal shows while unfocused: the preview length when previews are on
+/// and the user has not asked for the full output, else the embedded maximum.
+pub(crate) fn terminal_line_limit(preview_lines: usize, fully_shown: bool) -> usize {
+    if preview_lines == 0 || fully_shown {
+        EMBEDDED_TERMINAL_MAX_LINES
+    } else {
+        preview_lines
+    }
+}
+
 fn create_terminal(
     workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
@@ -740,7 +799,8 @@ fn create_terminal(
             cx,
         );
 
-        view.set_embedded_mode(Some(1000), cx);
+        let preview_lines = AgentSettings::get_global(cx).tool_output_preview_lines;
+        view.set_embedded_mode(Some(terminal_line_limit(preview_lines, false)), cx);
         view
     })
 }
@@ -818,7 +878,7 @@ mod tests {
     use gpui::{AppContext as _, TestAppContext};
     use parking_lot::RwLock;
 
-    use crate::entry_view_state::{Entry, EntryViewState};
+    use crate::entry_view_state::{Entry, EntryViewState, terminal_line_limit};
     use crate::message_editor::SessionCapabilities;
     use multi_buffer::MultiBufferRow;
     use pretty_assertions::assert_matches;
@@ -1034,5 +1094,16 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
         });
+    }
+
+    #[test]
+    fn test_terminal_line_limit() {
+        assert_eq!(terminal_line_limit(0, false), 1000, "previews off");
+        assert_eq!(terminal_line_limit(5, false), 5, "previewing");
+        assert_eq!(
+            terminal_line_limit(5, true),
+            1000,
+            "user asked for the full output"
+        );
     }
 }

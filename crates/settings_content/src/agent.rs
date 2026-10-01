@@ -364,6 +364,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_code_block: Option<bool>,
+    /// How many lines of an open tool or terminal output to show before a "Show all" toggle.
+    /// 0 shows the full output.
+    ///
+    /// Default: 0
+    pub tool_output_preview_lines: Option<usize>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).

@@ -749,6 +749,12 @@ impl Markdown {
         self.expanded_code_blocks.remove(&id);
     }
 
+    /// Whether a search match in this markdown is the active one, so views that hide part of
+    /// the content can show it.
+    pub fn has_active_search_highlight(&self) -> bool {
+        self.active_search_highlight_range().is_some()
+    }
+
     fn active_search_highlight_range(&self) -> Option<Range<usize>> {
         self.active_search_highlight
             .and_then(|index| self.search_highlights.get(index).cloned())
@@ -1931,6 +1937,7 @@ impl MarkdownElement {
 
         let mut container = h_flex()
             .id(("collapsed-code-block", id))
+            .debug_selector(|| "collapsed-code-block".into())
             .w_full()
             .justify_between()
             .gap_2()
@@ -8379,6 +8386,18 @@ mod tests {
             !text.contains("let hidden = 1;"),
             "the block collapses again once the search ends; got {text:?}"
         );
+    }
+
+    #[gpui::test]
+    fn test_has_active_search_highlight(cx: &mut TestAppContext) {
+        let markdown = cx.new(|cx| Markdown::new("one two".into(), None, None, cx));
+        markdown.update(cx, |markdown, cx| {
+            assert!(!markdown.has_active_search_highlight());
+            markdown.set_search_highlights(vec![0..3], None, cx);
+            assert!(!markdown.has_active_search_highlight());
+            markdown.set_active_search_highlight(Some(0), cx);
+            assert!(markdown.has_active_search_highlight());
+        });
     }
 
     #[test]

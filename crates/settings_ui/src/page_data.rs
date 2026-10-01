@@ -9024,6 +9024,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Tool Output Preview Lines",
+                description: "How many lines of an open tool or terminal output to show before a \"Show all\" toggle. 0 shows the full output.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.tool_output_preview_lines"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .tool_output_preview_lines
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .tool_output_preview_lines = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Terminal Thread Init Command",
                 description: "Command to automatically run when Zed creates a Terminal Thread shell in the agent panel. Runs in your configured shell.",
                 field: Box::new(SettingField {
