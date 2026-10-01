@@ -1,48 +1,69 @@
-# Zed
+# zedd
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+zedd is a personal fork of the [Zed](https://github.com/zed-industries/zed) code editor, focused on working with AI coding agents (Zed's own agent and external agents such as Claude Code over ACP). It is not affiliated with or endorsed by Zed Industries.
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+[Download the latest release](https://github.com/monarchmaisuriya/zedd/releases/latest) · [All releases](https://github.com/monarchmaisuriya/zedd/releases)
 
 ---
 
-### Installation
+## What's different from Zed
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+### Agent panel
 
-Other platforms are not yet available:
+- **Transcript views:** Normal (each run of tool calls folds into one line, like "Read 9 files ›"), Thinking (also shows thinking) and Verbose (every tool call in full). Switch with the dropdown next to the send button or `ctrl-o`; setting `agent.transcript_view`.
+- **Readable replies:** the agent's reply is drawn in pure white on dark themes, with tool activity, notices and thinking in a dimmer gray.
+- **Long output:** `agent.tool_output_preview_lines` limits open tool and terminal output to its first N lines, with "Show all"; long terminal commands collapse to two lines; code blocks follow `agent.expand_code_block`.
+- **Fork a thread** from any message or reply.
+- **Background tasks:** a list of the agent's background work (a dev server, a monitor) with a Stop button. It fills in once the Claude adapter ships [agentclientprotocol/claude-agent-acp#1206](https://github.com/agentclientprotocol/claude-agent-acp/pull/1206).
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+### Reviewing agent work
 
-### Developing Zed
+- **Branch review:** "Review Branch with Agent" in the git panel menu (or `git: review branch`) asks the agent to check your branch for bugs and security issues.
+- **Diff comments:** comment on lines in a diff and send them all to the agent at once (`cmd-alt-g c` to comment, `cmd-alt-g enter` to send). In an agent's diff they go to the thread that made the changes.
+- **Plan file:** when Claude asks to leave plan mode, its plan file opens next to the thread, and the approval card links to it.
+- **Verify gate:** `"agent_verification": { "command": "cargo test" }` in a project's `.zed/settings.json` runs the command after each agent turn that used tools, and asks the agent once to fix a failure. Trusted projects only; a check button in the message box turns it off per thread.
+- **Hooks for Zed's own agent:** `agent.hooks` in your user settings runs commands before and after tool calls, when you send a prompt, and when the agent stops. A failing hook blocks the step or reports back to the agent; hooks never approve anything on their own.
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+### Fixes for open Zed issues
 
-### Contributing
+| Zed issue | Fix in zedd |
+| --- | --- |
+| [#64410](https://github.com/zed-industries/zed/issues/64410) | Agent file writes no longer duplicate text. |
+| [#64538](https://github.com/zed-industries/zed/issues/64538) | A thread keeps updating when the agent mentions an unknown terminal. |
+| [#62828](https://github.com/zed-industries/zed/issues/62828) | After an agent process exits, the next thread starts a fresh agent. |
+| [#59323](https://github.com/zed-industries/zed/issues/59323) | Agents get 2 seconds to clean up before they are killed. |
+| [#60435](https://github.com/zed-industries/zed/issues/60435) | Unsent text to an external agent survives a restart. |
+| [#63177](https://github.com/zed-industries/zed/issues/63177) | Saving can no longer leave an empty file after a crash. |
+| [#55726](https://github.com/zed-industries/zed/issues/55726) | Opening a file to launch zedd restores your last session first. |
+| [#63202](https://github.com/zed-industries/zed/issues/63202) | The threads sidebar no longer redraws every row while an agent runs. |
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+### Removed
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+- Zed Pro pricing, trial and upsell surfaces, and the Zed-hosted model provider. Bring your own model providers or external agents.
 
-### Licensing
+## Install (macOS, Apple Silicon)
 
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
+1. Download `zedd-aarch64.dmg` from the [latest release](https://github.com/monarchmaisuriya/zedd/releases/latest), open it, and drag **zedd** to Applications.
+2. The app is not signed or notarized. The first time, right-click zedd in Applications and choose **Open**, or run `xattr -dr com.apple.quarantine /Applications/zedd.app`.
+3. zedd uses the system `git`, which must be installed (for example from the Xcode command line tools).
 
-License information for third party dependencies must be correctly provided for CI to pass.
+zedd uses the `dev` release channel, so it never updates itself into official Zed. It shares Zed's settings and data folders.
 
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
+Other platforms have no prebuilt release; build from source.
 
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
+## Build from source
 
-## Sponsorship
+Follow Zed's setup guides first: [macOS](./docs/src/development/macos.md), [Linux](./docs/src/development/linux.md), [Windows](./docs/src/development/windows.md).
 
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
+```sh
+cargo run -p zed                                # debug build
+ZEDD_SKIP_BUNDLED_GIT=1 ./script/bundle-mac     # release DMG at target/aarch64-apple-darwin/release/zedd-aarch64.dmg
+```
 
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+## Upstream
+
+zedd tracks [zed-industries/zed](https://github.com/zed-industries/zed). Fixes that belong in Zed or in an agent adapter are proposed upstream where possible. Zed is developed by Zed Industries, Inc.; to support Zed itself, see [zed.dev](https://zed.dev).
+
+## License
+
+Like Zed, zedd is licensed primarily under GPL-3.0-or-later ([LICENSE-GPL](./LICENSE-GPL)), with Apache-2.0 components where marked ([LICENSE-APACHE](./LICENSE-APACHE)). Third-party license compliance follows Zed's [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) setup in `script/licenses/`.
