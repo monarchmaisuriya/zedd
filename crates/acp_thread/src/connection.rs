@@ -236,6 +236,19 @@ pub trait AgentConnection {
         None
     }
 
+    /// Asks the agent to stop one of its background tasks. Resolves to whether it stopped; a
+    /// task that already finished does not.
+    fn stop_background_task(
+        &self,
+        _session_id: &acp_v1::SessionId,
+        _task_id: SharedString,
+        _cx: &mut App,
+    ) -> Task<Result<bool>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "this agent does not run background tasks"
+        )))
+    }
+
     fn fork(&self, _session_id: &acp_v1::SessionId, _cx: &App) -> Option<Rc<dyn AgentSessionFork>> {
         None
     }

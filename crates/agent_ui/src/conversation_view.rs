@@ -5660,6 +5660,42 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_background_tasks_show_in_the_activity_bar(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let has_activity_bar = |cx: &mut VisualTestContext| {
+            thread_view.update_in(cx, |view, window, cx| {
+                view.render_activity_bar(window, cx).is_some()
+            })
+        };
+        assert!(!has_activity_bar(cx), "nothing to show yet");
+
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_background_task_update(
+                    acp_thread::BackgroundTaskUpdate::Spawned(acp_thread::BackgroundTask {
+                        id: "task-1".into(),
+                        name: "npm run dev".into(),
+                        description: "Dev server".into(),
+                        state: acp_thread::BackgroundTaskState::Running,
+                        summary: None,
+                        tool_call_id: None,
+                        can_stop: true,
+                    }),
+                    cx,
+                )
+                .unwrap();
+        });
+        assert!(
+            has_activity_bar(cx),
+            "a background task shows in the activity bar"
+        );
+    }
+
+    #[gpui::test]
     async fn test_notification_when_panel_hidden(cx: &mut TestAppContext) {
         init_test(cx);
 

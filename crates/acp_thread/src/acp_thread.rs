@@ -3323,9 +3323,57 @@ struct RunningTurn {
     send_task: Task<()>,
 }
 
+/// Work the agent runs in the background, like a backgrounded shell command or a monitor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackgroundTask {
+    pub id: SharedString,
+    pub name: SharedString,
+    pub description: SharedString,
+    pub state: BackgroundTaskState,
+    pub summary: Option<SharedString>,
+    /// The tool call that started the task, once the agent knows it.
+    pub tool_call_id: Option<acp_v1::ToolCallId>,
+    pub can_stop: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundTaskState {
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl BackgroundTaskState {
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Stopped)
+    }
+}
+
+/// A change to the agent's background tasks, as the agent reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BackgroundTaskUpdate {
+    Spawned(BackgroundTask),
+    /// Only the fields that changed are set.
+    Progress {
+        id: SharedString,
+        description: Option<SharedString>,
+        summary: Option<SharedString>,
+        tool_call_id: Option<acp_v1::ToolCallId>,
+    },
+    State {
+        id: SharedString,
+        state: BackgroundTaskState,
+        summary: Option<SharedString>,
+    },
+}
+
 pub struct AcpThread {
     session_id: acp_v1::SessionId,
     work_dirs: Option<PathList>,
+    /// The agent's background tasks in the order they started; finished ones stay listed.
+    background_tasks: Vec<BackgroundTask>,
     parent_session_id: Option<acp_v1::SessionId>,
     title: Option<SharedString>,
     provisional_title: Option<SharedString>,
@@ -3669,6 +3717,7 @@ impl AcpThread {
                 idle_sleep_event_subscription,
             ],
             terminals: HashMap::default(),
+            background_tasks: Vec::new(),
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             had_error: false,
@@ -6452,6 +6501,64 @@ impl AcpThread {
             });
 
         Ok(())
+    }
+
+    pub fn background_tasks(&self) -> &[BackgroundTask] {
+        &self.background_tasks
+    }
+
+    /// Applies a background task change. An update for a task the agent never announced is an
+    /// error, since its fields would have nothing to merge into.
+    pub fn apply_background_task_update(
+        &mut self,
+        update: BackgroundTaskUpdate,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        match update {
+            BackgroundTaskUpdate::Spawned(task) => {
+                match self
+                    .background_tasks
+                    .iter_mut()
+                    .find(|known| known.id == task.id)
+                {
+                    Some(known) => *known = task,
+                    None => self.background_tasks.push(task),
+                }
+            }
+            BackgroundTaskUpdate::Progress {
+                id,
+                description,
+                summary,
+                tool_call_id,
+            } => {
+                let task = self.background_task_mut(&id)?;
+                if let Some(description) = description {
+                    task.description = description;
+                }
+                if summary.is_some() {
+                    task.summary = summary;
+                }
+                if tool_call_id.is_some() {
+                    task.tool_call_id = tool_call_id;
+                }
+            }
+            BackgroundTaskUpdate::State { id, state, summary } => {
+                let task = self.background_task_mut(&id)?;
+                task.state = state;
+                if summary.is_some() {
+                    task.summary = summary;
+                }
+            }
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    fn background_task_mut(&mut self, id: &str) -> Result<&mut BackgroundTask> {
+        self.background_tasks
+            .iter_mut()
+            .find(|task| task.id.as_ref() == id)
+            .with_context(|| format!("background task {id} was never announced"))
     }
 
     pub fn terminal(&self, terminal_id: acp_v1::TerminalId) -> Result<Entity<Terminal>> {
@@ -11805,6 +11912,72 @@ mod tests {
             assert!(call.locations.is_empty());
             assert!(call.resolved_locations.is_empty());
             assert!(thread.project.read(cx).agent_location().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_background_tasks_merge_updates_and_stay_listed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let task = BackgroundTask {
+            id: "task-1".into(),
+            name: "npm test".into(),
+            description: "Tests".into(),
+            state: BackgroundTaskState::Running,
+            summary: None,
+            tool_call_id: None,
+            can_stop: true,
+        };
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_background_task_update(BackgroundTaskUpdate::Spawned(task.clone()), cx)
+                .unwrap();
+            thread
+                .apply_background_task_update(
+                    BackgroundTaskUpdate::Progress {
+                        id: "task-1".into(),
+                        description: None,
+                        summary: Some("12 passed".into()),
+                        tool_call_id: Some(acp_v1::ToolCallId::new("toolu_1")),
+                    },
+                    cx,
+                )
+                .unwrap();
+            thread
+                .apply_background_task_update(
+                    BackgroundTaskUpdate::State {
+                        id: "task-1".into(),
+                        state: BackgroundTaskState::Completed,
+                        summary: None,
+                    },
+                    cx,
+                )
+                .unwrap();
+            assert!(
+                thread
+                    .apply_background_task_update(
+                        BackgroundTaskUpdate::State {
+                            id: "never-announced".into(),
+                            state: BackgroundTaskState::Failed,
+                            summary: None,
+                        },
+                        cx,
+                    )
+                    .is_err(),
+                "an update for an unannounced task has nothing to merge into"
+            );
+
+            assert_eq!(
+                thread.background_tasks(),
+                &[BackgroundTask {
+                    state: BackgroundTaskState::Completed,
+                    summary: Some("12 passed".into()),
+                    tool_call_id: Some(acp_v1::ToolCallId::new("toolu_1")),
+                    ..task
+                }],
+                "a finished task stays listed with its last summary"
+            );
         });
     }
 

@@ -686,6 +686,7 @@ pub struct ThreadView {
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
+    background_tasks_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
@@ -1104,6 +1105,7 @@ impl ThreadView {
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
+            background_tasks_expanded: true,
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
@@ -3346,13 +3348,20 @@ impl ThreadView {
         let plan = thread.plan().filter(|plan| !plan.is_empty());
         let has_plan = plan.is_some();
         let queue_is_empty = !self.has_queued_messages();
+        let background_tasks = thread.background_tasks();
+        let has_background_tasks = !background_tasks.is_empty();
 
         let awaiting_permission = self
             .render_main_agent_awaiting_permission(window, cx)
             .or_else(|| self.render_subagents_awaiting_permission(cx));
         let has_awaiting_permission = awaiting_permission.is_some();
 
-        if changed_buffers.is_empty() && !has_plan && queue_is_empty && !has_awaiting_permission {
+        if changed_buffers.is_empty()
+            && !has_plan
+            && queue_is_empty
+            && !has_awaiting_permission
+            && !has_background_tasks
+        {
             return None;
         }
 
@@ -3438,6 +3447,13 @@ impl ThreadView {
                         .when(queue_expanded, |parent| {
                             parent.child(self.render_message_queue_entries(window, cx))
                         })
+                    })
+                    .when(has_background_tasks, |this| {
+                        this.when(
+                            has_plan || !changed_buffers.is_empty() || !queue_is_empty,
+                            |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                        )
+                        .child(self.render_background_tasks(background_tasks, cx))
                     }),
             )
             .into_any()
@@ -3926,6 +3942,107 @@ impl ThreadView {
                     })),
             )
             .into_any_element()
+    }
+
+    /// The agent's background tasks, with a Stop button on each one still running.
+    fn render_background_tasks(
+        &self,
+        tasks: &[acp_thread::BackgroundTask],
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let running = tasks
+            .iter()
+            .filter(|task| !task.state.is_finished())
+            .count();
+        let title: SharedString = match (tasks.len(), running) {
+            (1, 1) => "1 Background Task, running".into(),
+            (1, _) => "1 Background Task".into(),
+            (count, 0) => format!("{count} Background Tasks").into(),
+            (count, running) => format!("{count} Background Tasks, {running} running").into(),
+        };
+        let expanded = self.background_tasks_expanded;
+        v_flex()
+            .child(
+                h_flex()
+                    .id("background-tasks-summary")
+                    .p_1()
+                    .gap_1()
+                    .child(Disclosure::new("background-tasks-disclosure", expanded))
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.background_tasks_expanded = !this.background_tasks_expanded;
+                        cx.notify();
+                    })),
+            )
+            .when(expanded, |this| {
+                this.children(tasks.iter().enumerate().map(|(ix, task)| {
+                    let (icon, color) = match task.state {
+                        acp_thread::BackgroundTaskState::Running => {
+                            (IconName::LoadCircle, Color::Muted)
+                        }
+                        acp_thread::BackgroundTaskState::Paused => {
+                            (IconName::DebugPause, Color::Muted)
+                        }
+                        acp_thread::BackgroundTaskState::Completed => {
+                            (IconName::Check, Color::Success)
+                        }
+                        acp_thread::BackgroundTaskState::Failed => (IconName::Close, Color::Error),
+                        acp_thread::BackgroundTaskState::Stopped => (IconName::Stop, Color::Muted),
+                    };
+                    let detail = task
+                        .summary
+                        .clone()
+                        .unwrap_or_else(|| task.description.clone());
+                    let task_id = task.id.clone();
+                    h_flex()
+                        .id(("background-task", ix))
+                        .px_2()
+                        .py_0p5()
+                        .gap_1p5()
+                        .justify_between()
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_1p5()
+                                .child(Icon::new(icon).size(IconSize::Small).color(color))
+                                .child(Label::new(task.name.clone()).size(LabelSize::Small))
+                                .when(!detail.is_empty() && detail != task.name, |this| {
+                                    this.child(
+                                        Label::new(detail)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    )
+                                }),
+                        )
+                        .when(task.can_stop && !task.state.is_finished(), |this| {
+                            this.child(
+                                Button::new(("stop-background-task", ix), "Stop")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.stop_background_task(task_id.clone(), cx);
+                                    })),
+                            )
+                        })
+                }))
+            })
+    }
+
+    fn stop_background_task(&mut self, task_id: SharedString, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+        let session_id = thread.session_id().clone();
+        let stop =
+            thread
+                .connection()
+                .clone()
+                .stop_background_task(&session_id, task_id.clone(), cx);
+        cx.spawn(async move |_, _| {
+            if !stop.await? {
+                log::info!("background task {task_id} had already finished");
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn clear_queue(&mut self, cx: &mut Context<Self>) {
