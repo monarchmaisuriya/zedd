@@ -33,7 +33,10 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::{any::Any, cell::RefCell};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+};
 use task::SpawnInTerminal;
 use thiserror::Error;
 use util::ResultExt as _;
@@ -112,6 +115,9 @@ struct ClientContext {
     sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>>,
     session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>>,
     request_elicitations: Entity<ElicitationStore>,
+    /// Set once the agent identifies as the Claude ACP adapter; see
+    /// [`injected_claude_user_turn`].
+    tags_injected_user_turns: Rc<Cell<bool>>,
 }
 
 fn dispatch_queue_closed_error() -> acp::Error {
@@ -709,6 +715,7 @@ impl AcpConnection {
 
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
+        let tags_injected_user_turns = Rc::new(Cell::new(false));
         let request_elicitations = cx.new(|_| ElicitationStore::default());
 
         // Set up the foreground dispatch channel for bridging Send handler
@@ -761,6 +768,7 @@ impl AcpConnection {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            tags_injected_user_turns: tags_injected_user_turns.clone(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -857,6 +865,7 @@ impl AcpConnection {
         let reads_air_fork_points = agent_info
             .as_ref()
             .is_some_and(|info| info.name == CLAUDE_AGENT_ACP_NAME);
+        tags_injected_user_turns.set(reads_air_fork_points);
         let telemetry_id = agent_info
             .as_ref()
             // Use the one the agent provides if we have one
@@ -2507,6 +2516,7 @@ pub mod test_support {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            tags_injected_user_turns: Rc::default(),
         };
         let dispatch_task = cx.spawn({
             let mut dispatch_rx = dispatch_rx;
@@ -2644,6 +2654,72 @@ mod tests {
     use super::*;
     use feature_flags::{AcpBetaFeatureFlag, FeatureFlag as _};
     use settings::Settings as _;
+
+    fn injected_turn(update: &acp::SessionUpdate) -> Option<(acp_thread::InjectedTurn, String)> {
+        let acp::SessionUpdate::UserMessageChunk(chunk) = update else {
+            return None;
+        };
+        let acp::ContentBlock::Text(text) = &chunk.content else {
+            return None;
+        };
+        let value = chunk
+            .meta
+            .as_ref()?
+            .get(acp_thread::INJECTED_TURN_META_KEY)?;
+        Some((
+            serde_json::from_value(value.clone()).ok()?,
+            text.text.clone(),
+        ))
+    }
+
+    fn user_turn(text: &str) -> acp::SessionUpdate {
+        acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(text.into()))
+    }
+
+    #[test]
+    fn test_subagent_hand_back_becomes_a_report_notice() {
+        let hand_back = "Another Claude session sent a message:\n<agent-message from=\"a1\">\n[Subagent hand-back] Preamble. The report follows:\n  # Research report: bots\n  \n  - **No single signal.**\n</agent-message>";
+        let rewritten = injected_claude_user_turn(&user_turn(hand_back)).expect("a hand-back");
+        assert_eq!(
+            injected_turn(&rewritten),
+            Some((
+                acp_thread::InjectedTurn::SubagentReport {
+                    title: Some("Research report: bots".to_string())
+                },
+                "# Research report: bots\n\n- **No single signal.**".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_task_notification_becomes_one_line() {
+        let notification = "<task-notification>\n<task-id>a1</task-id>\n<summary>Agent \"Explore\" finished</summary>\n<usage><subagent_tokens>10</subagent_tokens><tool_uses>78</tool_uses><duration_ms>348453</duration_ms></usage>\n</task-notification>";
+        let rewritten =
+            injected_claude_user_turn(&user_turn(notification)).expect("a notification");
+        assert_eq!(
+            injected_turn(&rewritten),
+            Some((
+                acp_thread::InjectedTurn::TaskNotification,
+                "Agent \"Explore\" finished · 78 tools · 5m 48s".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_real_prompts_and_agent_text_are_left_alone() {
+        assert!(
+            injected_claude_user_turn(&user_turn("why did the <task-notification> show up?"))
+                .is_none()
+        );
+        assert!(
+            injected_claude_user_turn(&acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    "<task-notification> is how background agents report".into()
+                )
+            ))
+            .is_none()
+        );
+    }
 
     fn init_feature_flags_test(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -4293,6 +4369,7 @@ exit 7
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),
             request_elicitations: request_elicitations.clone(),
+            tags_injected_user_turns: Rc::default(),
         };
         // `TestAppContext::spawn` hands out an `AsyncApp` by value, whereas the
         // production path uses `Context::spawn` which hands out `&mut AsyncApp`.
@@ -5199,6 +5276,85 @@ fn config_state(
     (modes, None)
 }
 
+/// Labeled stopgap. The Claude ACP adapter's history replay sends turns its harness injected
+/// (a subagent's hand-back, a task notification) as user messages, though its live prompt
+/// loop never sends them, so a reloaded thread showed them as if the user had typed them:
+/// https://github.com/agentclientprotocol/claude-agent-acp/issues/1203. The replay carries
+/// no marker, so they are recognized by their framing and rewritten as a tagged notice
+/// ([`acp_thread::InjectedTurn`]). Remove once the adapter marks these turns itself.
+fn injected_claude_user_turn(update: &acp::SessionUpdate) -> Option<acp::SessionUpdate> {
+    let acp::SessionUpdate::UserMessageChunk(chunk) = update else {
+        return None;
+    };
+    let acp::ContentBlock::Text(text) = &chunk.content else {
+        return None;
+    };
+    let text = text.text.trim_start();
+    let (turn, notice) =
+        if let Some(rest) = text.strip_prefix("Another Claude session sent a message:") {
+            let report = subagent_report_markdown(rest);
+            let title = report
+                .lines()
+                .find_map(|line| line.strip_prefix('#'))
+                .map(|heading| heading.trim_start_matches('#').trim().to_string())
+                .filter(|heading| !heading.is_empty());
+            (acp_thread::InjectedTurn::SubagentReport { title }, report)
+        } else if text.starts_with("<task-notification>") {
+            (
+                acp_thread::InjectedTurn::TaskNotification,
+                task_notification_line(text),
+            )
+        } else {
+            return None;
+        };
+    let mut chunk = chunk.clone();
+    chunk.content = acp::ContentBlock::Text(acp::TextContent::new(notice));
+    let mut meta = chunk.meta.take().unwrap_or_default();
+    meta.insert(
+        acp_thread::INJECTED_TURN_META_KEY.to_string(),
+        serde_json::to_value(turn).ok()?,
+    );
+    chunk.meta = Some(meta);
+    Some(acp::SessionUpdate::UserMessageChunk(chunk))
+}
+
+/// The report inside a hand-back: after the harness preamble, with the two-space indent the
+/// harness adds to every line removed.
+fn subagent_report_markdown(hand_back: &str) -> String {
+    let body = hand_back
+        .split_once("The report follows:")
+        .map(|(_, report)| report)
+        .unwrap_or(hand_back);
+    let body = body.trim_end();
+    let body = body.strip_suffix("</agent-message>").unwrap_or(body);
+    body.lines()
+        .filter(|line| !line.trim_start().starts_with("<agent-message"))
+        .map(|line| line.strip_prefix("  ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// One line for a task notification, e.g. `Agent "Explore" finished · 78 tools · 5m 48s`.
+fn task_notification_line(notification: &str) -> String {
+    let tag = |name: &str| {
+        let (_, rest) = notification.split_once(&format!("<{name}>"))?;
+        let (value, _) = rest.split_once(&format!("</{name}>"))?;
+        Some(value.trim().to_string())
+    };
+    let mut parts = vec![tag("summary").unwrap_or_else(|| "Background task finished".to_string())];
+    if let Some(tool_uses) = tag("tool_uses") {
+        parts.push(format!("{tool_uses} tools"));
+    }
+    if let Some(duration) = tag("duration_ms").and_then(|ms| ms.parse::<u64>().ok()) {
+        parts.push(util::time::duration_alt_display(
+            std::time::Duration::from_millis(duration),
+        ));
+    }
+    parts.join(" · ")
+}
+
 /// The `agentInfo.name` of the Claude ACP adapter, which reads fork points from
 /// `_meta.jetbrains.air.fork`.
 const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
@@ -5697,7 +5853,7 @@ fn handle_read_text_file(
 }
 
 fn handle_session_notification(
-    notification: acp::SessionNotification,
+    mut notification: acp::SessionNotification,
     cx: &mut AsyncApp,
     ctx: &ClientContext,
 ) {
@@ -5752,6 +5908,12 @@ fn handle_session_notification(
     let Some(_thread) = thread.upgrade() else {
         return;
     };
+
+    if ctx.tags_injected_user_turns.get()
+        && let Some(update) = injected_claude_user_turn(&notification.update)
+    {
+        notification.update = update;
+    }
 
     // Pre-handle: if a ToolCall carries terminal_info, create/register a display-only terminal.
     if let acp::SessionUpdate::ToolCall(tc) = &notification.update {

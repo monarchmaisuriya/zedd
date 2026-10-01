@@ -345,6 +345,23 @@ impl ThreadSearchBar {
         let entry_view_state = self.entry_view_state.read(cx);
         for (entry_ix, entry) in thread.entries().iter().enumerate() {
             match entry {
+                // An injected turn renders as a notice; only an opened report shows text.
+                AgentThreadEntry::UserMessage(message) if message.injected_turn().is_some() => {
+                    if matches!(
+                        message.injected_turn(),
+                        Some(acp_thread::InjectedTurn::SubagentReport { .. })
+                    ) && entry_view_state.is_subagent_report_expanded(entry_ix)
+                    {
+                        for markdown in message.content.markdowns() {
+                            let source = markdown.read(cx).source().clone();
+                            targets.push(SearchTarget::Markdown {
+                                entry_ix,
+                                markdown: markdown.clone(),
+                                source,
+                            });
+                        }
+                    }
+                }
                 // Past user messages render through `MessageEditor`, not markdown.
                 AgentThreadEntry::UserMessage(_) => {
                     let editor = entry_view_state
@@ -362,7 +379,9 @@ impl ThreadSearchBar {
                     });
                 }
                 _ => {
-                    for markdown in collect_markdowns(entry_ix, entry, &entry_view_state, cx) {
+                    for markdown in
+                        collect_markdowns(thread.entries(), entry_ix, entry, &entry_view_state, cx)
+                    {
                         let source = markdown.read(cx).source().clone();
                         targets.push(SearchTarget::Markdown {
                             entry_ix,
@@ -943,6 +962,7 @@ fn nav_button(
 }
 
 fn collect_markdowns(
+    entries: &[AgentThreadEntry],
     entry_ix: usize,
     entry: &AgentThreadEntry,
     entry_view_state: &EntryViewState,
@@ -958,9 +978,10 @@ fn collect_markdowns(
                         out.extend(block.markdowns().cloned());
                     }
                     AssistantMessageChunk::Thought { block, .. }
-                        if entry_view_state
-                            .thinking_block_state((entry_ix, chunk_ix), cx)
-                            .0 =>
+                        if entry_view_state.shows_thinking()
+                            && entry_view_state
+                                .thinking_block_state((entry_ix, chunk_ix), cx)
+                                .0 =>
                     {
                         out.extend(block.markdowns().cloned());
                     }
@@ -969,7 +990,9 @@ fn collect_markdowns(
             }
         }
         AgentThreadEntry::ToolCall(tool_call) => {
-            out.push(tool_call.label.clone());
+            if entry_view_state.is_tool_call_label_shown(entries, entry_ix, tool_call, cx) {
+                out.push(tool_call.label.clone());
+            }
             if entry_view_state.is_tool_call_content_visible(tool_call) {
                 out.extend(
                     tool_call

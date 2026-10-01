@@ -7090,6 +7090,12 @@ mod tests {
     ) {
         init_test(cx);
         cx.update(|cx| {
+            crate::conversation_view::tests::set_transcript_view(
+                settings::TranscriptView::Verbose,
+                cx,
+            )
+        });
+        cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
         });

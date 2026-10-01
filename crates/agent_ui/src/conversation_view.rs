@@ -93,12 +93,12 @@ use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
     AuthorizeToolCall, ClearMessageQueue, CycleFavoriteModels, CycleModeSelector,
-    CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, KeepAll, NewThread,
-    OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
-    ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
-    ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
-    ScrollOutputToTop, SendImmediately, SendNextQueuedMessage, ToggleFastMode,
-    ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
+    CycleThinkingEffort, CycleTranscriptView, EditFirstQueuedMessage, ExpandMessageEditor, Follow,
+    KeepAll, NewThread, OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce,
+    RemoveFirstQueuedMessage, ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown,
+    ScrollOutputPageUp, ScrollOutputToBottom, ScrollOutputToNextMessage,
+    ScrollOutputToPreviousMessage, ScrollOutputToTop, SendImmediately, SendNextQueuedMessage,
+    ToggleFastMode, ToggleProfileSelector, ToggleSteerFirstQueuedMessage, ToggleThinkingEffortMenu,
     ToggleThinkingMode, UndoLastReject,
 };
 
@@ -111,6 +111,7 @@ pub(crate) mod elicitation;
 mod message_queue;
 mod thread_search_bar;
 mod thread_view;
+mod tool_run_summary;
 pub use message_queue::*;
 pub use thread_view::*;
 
@@ -853,7 +854,7 @@ impl ConversationView {
         let mut subscriptions = vec![
             cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<SettingsStore>(window, Self::invalidate_mermaid_caches),
-            cx.observe_global_in::<SettingsStore>(window, Self::apply_terminal_preview_limits),
+            cx.observe_global_in::<SettingsStore>(window, Self::apply_agent_display_settings),
             cx.observe_global_in::<AgentUiFontSize>(window, Self::agent_ui_font_size_changed),
             cx.observe_global_in::<AgentBufferFontSize>(window, Self::agent_ui_font_size_changed),
             cx.subscribe_in(
@@ -1306,6 +1307,11 @@ impl ConversationView {
                 session_capabilities.clone(),
                 self.agent.agent_id(),
             )
+        });
+
+        let transcript_view = AgentSettings::get_global(cx).transcript_view;
+        entry_view_state.update(cx, |state, _| {
+            state.set_transcript_view(transcript_view);
         });
 
         let count = thread.read(cx).entries().len();
@@ -3194,14 +3200,15 @@ impl ConversationView {
         }
     }
 
-    fn apply_terminal_preview_limits(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_agent_display_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(connected) = self.as_connected() else {
             return;
         };
         let thread_views = connected.threads.values().cloned().collect::<Vec<_>>();
         for thread_view in thread_views {
             thread_view.update(cx, |thread_view, cx| {
-                thread_view.apply_terminal_preview_limits(cx)
+                thread_view.apply_terminal_preview_limits(cx);
+                thread_view.apply_transcript_view(window, cx);
             });
         }
     }
@@ -3764,7 +3771,7 @@ pub(crate) mod tests {
     use parking_lot::Mutex;
     use project::Project;
     use serde_json::json;
-    use settings::SettingsStore;
+    use settings::{SettingsStore, TranscriptView};
     use std::any::Any;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -8048,6 +8055,7 @@ pub(crate) mod tests {
     #[gpui::test]
     async fn test_thread_search_includes_expanded_thinking_blocks(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| set_transcript_view(TranscriptView::Thinking, cx));
 
         let connection = StubAgentConnection::new();
         connection.set_next_prompt_updates(vec![
@@ -8252,6 +8260,7 @@ pub(crate) mod tests {
         use agent_client_protocol::schema::v2 as acp_v2;
 
         init_test(cx);
+        cx.update(|cx| set_transcript_view(TranscriptView::Thinking, cx));
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::default_response(), cx).await;
         let thread_view = active_thread(&conversation_view, cx);
@@ -8649,6 +8658,7 @@ pub(crate) mod tests {
     #[gpui::test]
     async fn test_code_blocks_in_tool_output_follow_expand_code_block(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| set_transcript_view(TranscriptView::Verbose, cx));
         let tool_call_id = acp_v1::ToolCallId::new("code-tool-output");
         let connection = StubAgentConnection::new();
         connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(
@@ -8699,6 +8709,7 @@ pub(crate) mod tests {
         cx: &'a mut TestAppContext,
     ) -> (Entity<ConversationView>, &'a mut VisualTestContext) {
         init_test(cx);
+        cx.update(|cx| set_transcript_view(TranscriptView::Verbose, cx));
         let tool_call_id = acp_v1::ToolCallId::new("long-tool-output");
         let connection = StubAgentConnection::new();
         connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(
@@ -8746,6 +8757,7 @@ pub(crate) mod tests {
         &'a mut VisualTestContext,
     ) {
         init_test(cx);
+        cx.update(|cx| set_transcript_view(TranscriptView::Verbose, cx));
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
         add_to_workspace_with_size(conversation_view.clone(), true, cx);
@@ -8858,6 +8870,271 @@ pub(crate) mod tests {
         );
     }
 
+    /// Opens a thread in `transcript_view` whose agent sent `updates` for one prompt.
+    async fn setup_tool_run(
+        updates: Vec<acp_v1::SessionUpdate>,
+        transcript_view: TranscriptView,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AcpThread>, &mut VisualTestContext) {
+        init_test(cx);
+        cx.update(|cx| set_transcript_view(transcript_view, cx));
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(updates);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Do the work", cx))
+            .await
+            .expect("prompt");
+        cx.run_until_parked();
+        (thread, cx)
+    }
+
+    fn finished_tool(id: &str, kind: acp_v1::ToolKind, title: &str) -> acp_v1::ToolCall {
+        acp_v1::ToolCall::new(acp_v1::ToolCallId::new(id), title)
+            .kind(kind)
+            .status(acp_v1::ToolCallStatus::Completed)
+            .content(vec![format!("output of {id}").into()])
+    }
+
+    fn three_tools() -> Vec<acp_v1::SessionUpdate> {
+        vec![
+            acp_v1::SessionUpdate::ToolCall(
+                finished_tool("read-a", acp_v1::ToolKind::Read, "Read a.rs")
+                    .locations(vec![acp_v1::ToolCallLocation::new("/src/a.rs")]),
+            ),
+            acp_v1::SessionUpdate::ToolCall(
+                finished_tool("read-b", acp_v1::ToolKind::Read, "Read b.rs")
+                    .locations(vec![acp_v1::ToolCallLocation::new("/src/b.rs")]),
+            ),
+            acp_v1::SessionUpdate::ToolCall(finished_tool(
+                "run-tests",
+                acp_v1::ToolKind::Execute,
+                "cargo test",
+            )),
+        ]
+    }
+
+    #[gpui::test]
+    async fn test_consecutive_tool_calls_fold_into_one_line(cx: &mut TestAppContext) {
+        let (_thread, cx) = setup_tool_run(three_tools(), TranscriptView::Normal, cx).await;
+        assert!(cx.debug_bounds("tool-run-summary").is_some());
+        assert!(cx.debug_bounds("tool-run-member-1").is_none());
+        assert!(cx.debug_bounds("tool-call-output-1-0").is_none());
+
+        let summary = cx
+            .debug_bounds("tool-run-summary")
+            .expect("folded run has a summary line");
+        cx.simulate_click(summary.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-run-member-2").is_some());
+        assert!(cx.debug_bounds("tool-run-member-3").is_some());
+        let member = cx
+            .debug_bounds("tool-run-member-1")
+            .expect("an open run lists its tool calls");
+        assert!(cx.debug_bounds("tool-call-output-1-0").is_none());
+
+        cx.simulate_click(member.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tool-call-output-1-0").is_some(),
+            "an opened tool call shows its output"
+        );
+
+        let summary = cx
+            .debug_bounds("tool-run-summary")
+            .expect("summary line stays");
+        cx.simulate_click(summary.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-run-member-1").is_none());
+        assert!(
+            cx.debug_bounds("tool-call-output-1-0").is_none(),
+            "closing the run closes its tool calls"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_tool_call_awaiting_permission_is_never_folded(cx: &mut TestAppContext) {
+        let (thread, cx) = setup_tool_run(three_tools(), TranscriptView::Normal, cx).await;
+        let _authorization = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp_v1::ToolCallUpdate::new(
+                        acp_v1::ToolCallId::new("run-tests"),
+                        acp_v1::ToolCallUpdateFields::new(),
+                    ),
+                    PermissionOptions::Flat(vec![acp_v1::PermissionOption::new(
+                        "allow-tests",
+                        "Allow",
+                        acp_v1::PermissionOptionKind::AllowOnce,
+                    )]),
+                    acp_thread::AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .expect("authorization request");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tool-run-summary").is_some(),
+            "the finished tool calls before it still fold"
+        );
+        assert!(
+            cx.debug_bounds("permission-buttons-3").is_some(),
+            "the tool call awaiting permission keeps its buttons on screen"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_verbose_view_shows_every_tool_call(cx: &mut TestAppContext) {
+        let (_thread, cx) = setup_tool_run(three_tools(), TranscriptView::Verbose, cx).await;
+        assert!(cx.debug_bounds("tool-run-summary").is_none());
+
+        cx.update(|_, cx| set_transcript_view(TranscriptView::Normal, cx));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tool-run-summary").is_some(),
+            "switching to normal folds the run"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_normal_view_hides_thinking(cx: &mut TestAppContext) {
+        let updates = vec![
+            acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                "Weighing the options.".into(),
+            )),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Here is the answer.".into(),
+            )),
+        ];
+        let (_thread, cx) = setup_tool_run(updates, TranscriptView::Normal, cx).await;
+        assert!(cx.debug_bounds("thinking-block").is_none());
+
+        cx.update(|_, cx| set_transcript_view(TranscriptView::Thinking, cx));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("thinking-block").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_lone_tool_call_opens_directly(cx: &mut TestAppContext) {
+        let updates = vec![acp_v1::SessionUpdate::ToolCall(finished_tool(
+            "run-tests",
+            acp_v1::ToolKind::Execute,
+            "cargo test",
+        ))];
+        let (_thread, cx) = setup_tool_run(updates, TranscriptView::Normal, cx).await;
+        let line = cx
+            .debug_bounds("tool-run-summary")
+            .expect("a lone tool call still folds into one line");
+        assert!(cx.debug_bounds("tool-call-output-1-0").is_none());
+
+        cx.simulate_click(line.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tool-run-member-1").is_none(),
+            "a lone tool call has no member line"
+        );
+        assert!(
+            cx.debug_bounds("tool-call-output-1-0").is_some(),
+            "its line opens straight to its output"
+        );
+
+        let line = cx.debug_bounds("tool-run-summary").expect("the line stays");
+        cx.simulate_click(line.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-output-1-0").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_edit_without_location_names_its_file_from_its_diff(cx: &mut TestAppContext) {
+        let updates = vec![acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new("edit-plan", "Edit file")
+                .kind(acp_v1::ToolKind::Edit)
+                .status(acp_v1::ToolCallStatus::Completed)
+                .content(vec![acp_v1::ToolCallContent::Diff(
+                    acp_v1::Diff::new("/project/docs/plan.md", "new plan").old_text("old plan"),
+                )]),
+        )];
+        let (thread, cx) = setup_tool_run(updates, TranscriptView::Normal, cx).await;
+        let subject = thread.read_with(cx, |thread, cx| {
+            let (_, tool_call) = thread
+                .tool_call(&acp_v1::ToolCallId::new("edit-plan"))
+                .expect("edit tool call");
+            ThreadView::tool_summary_item(tool_call, cx).subject
+        });
+        assert_eq!(subject.as_deref(), Some("plan.md"));
+    }
+
+    fn injected_turn_chunk(
+        message_id: &str,
+        text: &str,
+        turn: acp_thread::InjectedTurn,
+    ) -> acp_v1::SessionUpdate {
+        let meta = acp_v1::Meta::from_iter([(
+            acp_thread::INJECTED_TURN_META_KEY.to_string(),
+            serde_json::to_value(turn).expect("injected turn serializes"),
+        )]);
+        acp_v1::SessionUpdate::UserMessageChunk(
+            acp_v1::ContentChunk::new(text.into())
+                .message_id(acp_v1::MessageId::new(message_id))
+                .meta(meta),
+        )
+    }
+
+    #[gpui::test]
+    async fn test_injected_turns_render_as_notices(cx: &mut TestAppContext) {
+        let updates = vec![
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Waiting for the research agent.".into(),
+            )),
+            injected_turn_chunk(
+                "report",
+                "# Research report\n\nThe papaya finding.",
+                acp_thread::InjectedTurn::SubagentReport {
+                    title: Some("Research report".to_string()),
+                },
+            ),
+            injected_turn_chunk(
+                "notification",
+                "Agent \"Research\" finished · 78 tools · 5m 48s",
+                acp_thread::InjectedTurn::TaskNotification,
+            ),
+        ];
+        let (_thread, cx) = setup_tool_run(updates, TranscriptView::Normal, cx).await;
+        assert!(cx.debug_bounds("task-notification-3").is_some());
+        assert!(cx.debug_bounds("subagent-report-body-2").is_none());
+
+        let report = cx
+            .debug_bounds("subagent-report-2")
+            .expect("a subagent report is one line");
+        cx.simulate_click(report.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("subagent-report-body-2").is_some(),
+            "the line opens to the report"
+        );
+
+        let report = cx
+            .debug_bounds("subagent-report-2")
+            .expect("the line stays");
+        cx.simulate_click(report.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("subagent-report-body-2").is_none());
+    }
+
+    /// Card-centric tests check the verbose view; folding tests use the others.
+    pub(crate) fn set_transcript_view(transcript_view: TranscriptView, cx: &mut App) {
+        use gpui::UpdateGlobal as _;
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().transcript_view = Some(transcript_view);
+            });
+        });
+    }
+
     fn numbered_lines(count: usize) -> String {
         (1..=count)
             .map(|line| format!("line {line}"))
@@ -8931,6 +9208,7 @@ pub(crate) mod tests {
     #[gpui::test]
     async fn test_terminal_output_is_previewed_until_shown_in_full(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| set_transcript_view(TranscriptView::Verbose, cx));
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
         add_to_workspace_with_size(conversation_view.clone(), true, cx);
@@ -9212,6 +9490,7 @@ pub(crate) mod tests {
         use agent_client_protocol::schema::v2 as acp_v2;
 
         init_test(cx);
+        cx.update(|cx| set_transcript_view(TranscriptView::Verbose, cx));
         cx.update(|cx| {
             AgentSettings::override_global(
                 AgentSettings {
@@ -10153,6 +10432,7 @@ pub(crate) mod tests {
     #[gpui::test]
     async fn test_thread_search_tracks_tool_name_fallback(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| set_transcript_view(TranscriptView::Verbose, cx));
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
         let thread_view = active_thread(&conversation_view, cx);
@@ -12001,6 +12281,7 @@ pub(crate) mod tests {
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
+        cx.update(|cx| set_transcript_view(TranscriptView::Verbose, cx));
         for (exit_status, failure_selector) in [
             (
                 acp_v1::TerminalExitStatus::new().exit_code(7),
@@ -12146,6 +12427,7 @@ pub(crate) mod tests {
     #[gpui::test]
     async fn test_acp_owned_terminal_tool_card_is_interactive(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| set_transcript_view(TranscriptView::Verbose, cx));
         let (conversation_view, cx) =
             setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
         add_to_workspace_with_size(conversation_view.clone(), true, cx);

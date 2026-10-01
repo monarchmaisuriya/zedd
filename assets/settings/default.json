@@ -1389,6 +1389,12 @@
     //
     // Default: auto
     "thinking_display": "auto",
+    // How much of the agent's work the transcript shows:
+    // "normal" folds each run of tool calls into a one-line summary and hides thinking,
+    // "thinking" also shows thinking, "verbose" shows every tool call in full.
+    //
+    // Default: normal
+    "transcript_view": "normal",
     // Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     // Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     //

@@ -236,6 +236,12 @@ impl DiffPatchHunk {
     }
 }
 
+/// The path a change leaves behind: the new path, or the old one for a deletion.
+pub fn diff_change_path(change: &acp_v2::DiffChange) -> Option<&Path> {
+    let (old_path, new_path) = diff_change_paths(change)?;
+    new_path.or(old_path)
+}
+
 fn diff_change_paths(change: &acp_v2::DiffChange) -> Option<(Option<&Path>, Option<&Path>)> {
     match &change.operation {
         acp_v2::DiffChangeOperation::Add(change) => Some((None, Some(&change.path.0))),
