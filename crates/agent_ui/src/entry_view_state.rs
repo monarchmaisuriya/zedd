@@ -61,6 +61,8 @@ pub struct EntryViewState {
     auto_expanded_thinking_block: Option<(usize, usize)>,
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
+    /// Subagent reports the user opened, by entry index.
+    expanded_subagent_reports: HashSet<usize>,
     expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
     /// Tool calls whose output the user chose to show beyond `tool_output_preview_lines`.
     fully_shown_tool_outputs: HashSet<acp_v1::ToolCallId>,
@@ -93,6 +95,7 @@ impl EntryViewState {
             auto_expanded_thinking_block: None,
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
+            expanded_subagent_reports: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
             fully_shown_tool_outputs: HashSet::default(),
             overflowing_commands: HashSet::default(),
@@ -320,6 +323,16 @@ impl EntryViewState {
     pub(crate) fn toggle_compaction_expansion(&mut self, entry_ix: usize) {
         if !self.expanded_compactions.remove(&entry_ix) {
             self.expanded_compactions.insert(entry_ix);
+        }
+    }
+
+    pub(crate) fn is_subagent_report_expanded(&self, entry_ix: usize) -> bool {
+        self.expanded_subagent_reports.contains(&entry_ix)
+    }
+
+    pub(crate) fn toggle_subagent_report(&mut self, entry_ix: usize) {
+        if !self.expanded_subagent_reports.remove(&entry_ix) {
+            self.expanded_subagent_reports.insert(entry_ix);
         }
     }
 
@@ -711,6 +724,11 @@ impl EntryViewState {
 
         self.expanded_compactions = self
             .expanded_compactions
+            .iter()
+            .filter_map(|&entry_ix| reindex_after_removal(entry_ix, &range))
+            .collect();
+        self.expanded_subagent_reports = self
+            .expanded_subagent_reports
             .iter()
             .filter_map(|&entry_ix| reindex_after_removal(entry_ix, &range))
             .collect();

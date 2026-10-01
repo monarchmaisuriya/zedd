@@ -127,6 +127,20 @@ pub fn command_category_from_meta(meta: &Option<acp_v1::Meta>) -> Option<Command
 /// Key used in ACP ToolCall meta to store the session id and message indexes
 pub const SUBAGENT_SESSION_INFO_META_KEY: &str = "subagent_session_info";
 
+/// `_meta` key a client-side agent adapter sets on a user message that the agent's harness
+/// injected rather than the user typed. Its value is an [`InjectedTurn`].
+pub const INJECTED_TURN_META_KEY: &str = "zed_injected_turn";
+
+/// A user message the agent's harness injected, shown as a notice instead of a prompt.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InjectedTurn {
+    /// A subagent's report; the message holds the report as markdown.
+    SubagentReport { title: Option<String> },
+    /// A background task's notice; the message holds its one-line summary.
+    TaskNotification,
+}
+
 pub const SANDBOX_AUTHORIZATION_META_KEY: &str = "sandbox_authorization";
 
 /// Stable `PermissionOption` ids for the sandbox-escalation approval prompt.
@@ -304,6 +318,13 @@ pub struct UserMessage {
     pub content: MessageContent,
     pub checkpoint: Option<Checkpoint>,
     pub indented: bool,
+}
+
+impl UserMessage {
+    pub fn injected_turn(&self) -> Option<InjectedTurn> {
+        let value = self.meta.as_ref()?.get(INJECTED_TURN_META_KEY)?;
+        serde_json::from_value(value.clone()).ok()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3871,6 +3892,7 @@ impl AcpThread {
             acp_v1::SessionUpdate::UserMessageChunk(acp_v1::ContentChunk {
                 content,
                 message_id,
+                meta,
                 ..
             }) => {
                 let content = content::from_v1(content).map_err(acp_v1::Error::from)?;
@@ -3897,7 +3919,7 @@ impl AcpThread {
                         already_in_user_message
                     });
                 if !already_in_user_message {
-                    self.push_user_content_block_from_agent(message_id, content, cx);
+                    self.push_user_content_block_from_agent(message_id, content, meta, cx);
                 }
             }
             acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk {
@@ -4279,6 +4301,7 @@ impl AcpThread {
             client_id.is_some(),
             None,
             chunk,
+            None,
             indented,
             cx,
         )
@@ -4288,17 +4311,20 @@ impl AcpThread {
         &mut self,
         id: Option<acp_v1::MessageId>,
         chunk: acp_v2::ContentBlock,
+        meta: Option<acp_v2::Meta>,
         cx: &mut Context<Self>,
     ) {
-        self.push_user_content_block_with_protocol_id(None, false, id, chunk, false, cx)
+        self.push_user_content_block_with_protocol_id(None, false, id, chunk, meta, false, cx)
     }
 
+    /// `meta` is kept from the chunk that starts a message.
     fn push_user_content_block_with_protocol_id(
         &mut self,
         incoming_client_id: Option<ClientUserMessageId>,
         is_optimistic: bool,
         protocol_id: Option<acp_v1::MessageId>,
         chunk: acp_v2::ContentBlock,
+        meta: Option<acp_v2::Meta>,
         indented: bool,
         cx: &mut Context<Self>,
     ) {
@@ -4339,7 +4365,7 @@ impl AcpThread {
             self.push_entry(
                 AgentThreadEntry::UserMessage(UserMessage {
                     identity: MessageIdentity::Legacy(protocol_id),
-                    meta: None,
+                    meta,
                     client_id: incoming_client_id,
                     is_optimistic,
                     content,
@@ -9872,6 +9898,7 @@ mod tests {
                 true,
                 None,
                 "Typed prompt".into(),
+                None,
                 false,
                 cx,
             );

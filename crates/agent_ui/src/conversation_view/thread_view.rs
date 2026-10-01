@@ -6289,6 +6289,9 @@ impl ThreadView {
         let mut assistant_message_is_blank = false;
 
         let primary = match &entry {
+            AgentThreadEntry::UserMessage(message) if message.injected_turn().is_some() => {
+                self.render_injected_turn(entry_ix, message, window, cx)
+            }
             AgentThreadEntry::UserMessage(message) => {
                 let Some(editor) = self
                     .entry_view_state
@@ -8543,6 +8546,95 @@ impl ThreadView {
             }
         }
         counts
+    }
+
+    /// A turn the agent's harness injected: a task notification is one line, a subagent's
+    /// report is one line that opens to the report.
+    fn render_injected_turn(
+        &self,
+        entry_ix: usize,
+        message: &acp_thread::UserMessage,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let line = |text: SharedString| {
+            Label::new(text)
+                .size(LabelSize::Custom(self.tool_name_font_size()))
+                .color(Color::Muted)
+                .truncate()
+        };
+        match message.injected_turn() {
+            Some(acp_thread::InjectedTurn::TaskNotification) => h_flex()
+                .id(("task-notification", entry_ix))
+                .debug_selector(move || format!("task-notification-{entry_ix}"))
+                .w_full()
+                .px_5()
+                .py_0p5()
+                .child(line(message.content.to_markdown(cx).into()))
+                .into_any(),
+            Some(acp_thread::InjectedTurn::SubagentReport { title }) => {
+                let is_open = self
+                    .entry_view_state
+                    .read(cx)
+                    .is_subagent_report_expanded(entry_ix);
+                let label = match title {
+                    Some(title) => format!("Report from subagent: {title}"),
+                    None => "Report from subagent".to_string(),
+                };
+                v_flex()
+                    .w_full()
+                    .child(
+                        h_flex()
+                            .id(("subagent-report", entry_ix))
+                            .debug_selector(move || format!("subagent-report-{entry_ix}"))
+                            .w_full()
+                            .px_5()
+                            .py_0p5()
+                            .gap_1()
+                            .cursor_pointer()
+                            .child(line(label.into()))
+                            .child(
+                                Icon::new(if is_open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.entry_view_state.update(cx, |state, _| {
+                                    state.toggle_subagent_report(entry_ix);
+                                });
+                                this.list_state.remeasure_items(entry_ix..entry_ix + 1);
+                                this.refresh_thread_search(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .when(is_open, |this| {
+                        this.child(
+                            div()
+                                .ml_5()
+                                .mr_5()
+                                .pl_3()
+                                .py_1()
+                                .border_l_1()
+                                .border_color(self.tool_card_border_color(cx))
+                                .text_ui(cx)
+                                .debug_selector(move || format!("subagent-report-body-{entry_ix}"))
+                                .child(self.render_message_content(
+                                    entry_ix,
+                                    0,
+                                    &message.content,
+                                    window,
+                                    cx,
+                                )),
+                        )
+                    })
+                    .into_any()
+            }
+            None => Empty.into_any(),
+        }
     }
 
     /// One entry of a folded run: the run's summary line on its first tool call, and, while

@@ -9068,6 +9068,63 @@ pub(crate) mod tests {
         assert_eq!(subject.as_deref(), Some("plan.md"));
     }
 
+    fn injected_turn_chunk(
+        message_id: &str,
+        text: &str,
+        turn: acp_thread::InjectedTurn,
+    ) -> acp_v1::SessionUpdate {
+        let meta = acp_v1::Meta::from_iter([(
+            acp_thread::INJECTED_TURN_META_KEY.to_string(),
+            serde_json::to_value(turn).expect("injected turn serializes"),
+        )]);
+        acp_v1::SessionUpdate::UserMessageChunk(
+            acp_v1::ContentChunk::new(text.into())
+                .message_id(acp_v1::MessageId::new(message_id))
+                .meta(meta),
+        )
+    }
+
+    #[gpui::test]
+    async fn test_injected_turns_render_as_notices(cx: &mut TestAppContext) {
+        let updates = vec![
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "Waiting for the research agent.".into(),
+            )),
+            injected_turn_chunk(
+                "report",
+                "# Research report\n\nThe papaya finding.",
+                acp_thread::InjectedTurn::SubagentReport {
+                    title: Some("Research report".to_string()),
+                },
+            ),
+            injected_turn_chunk(
+                "notification",
+                "Agent \"Research\" finished · 78 tools · 5m 48s",
+                acp_thread::InjectedTurn::TaskNotification,
+            ),
+        ];
+        let (_thread, cx) = setup_tool_run(updates, TranscriptView::Normal, cx).await;
+        assert!(cx.debug_bounds("task-notification-3").is_some());
+        assert!(cx.debug_bounds("subagent-report-body-2").is_none());
+
+        let report = cx
+            .debug_bounds("subagent-report-2")
+            .expect("a subagent report is one line");
+        cx.simulate_click(report.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("subagent-report-body-2").is_some(),
+            "the line opens to the report"
+        );
+
+        let report = cx
+            .debug_bounds("subagent-report-2")
+            .expect("the line stays");
+        cx.simulate_click(report.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("subagent-report-body-2").is_none());
+    }
+
     /// Card-centric tests check the verbose view; folding tests use the others.
     pub(crate) fn set_transcript_view(transcript_view: TranscriptView, cx: &mut App) {
         use gpui::UpdateGlobal as _;

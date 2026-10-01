@@ -345,6 +345,23 @@ impl ThreadSearchBar {
         let entry_view_state = self.entry_view_state.read(cx);
         for (entry_ix, entry) in thread.entries().iter().enumerate() {
             match entry {
+                // An injected turn renders as a notice; only an opened report shows text.
+                AgentThreadEntry::UserMessage(message) if message.injected_turn().is_some() => {
+                    if matches!(
+                        message.injected_turn(),
+                        Some(acp_thread::InjectedTurn::SubagentReport { .. })
+                    ) && entry_view_state.is_subagent_report_expanded(entry_ix)
+                    {
+                        for markdown in message.content.markdowns() {
+                            let source = markdown.read(cx).source().clone();
+                            targets.push(SearchTarget::Markdown {
+                                entry_ix,
+                                markdown: markdown.clone(),
+                                source,
+                            });
+                        }
+                    }
+                }
                 // Past user messages render through `MessageEditor`, not markdown.
                 AgentThreadEntry::UserMessage(_) => {
                     let editor = entry_view_state
