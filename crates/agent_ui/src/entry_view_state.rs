@@ -180,6 +180,17 @@ impl EntryViewState {
         }
     }
 
+    /// A run of one tool call opens straight to that tool, so the run and the tool open
+    /// and close together.
+    pub(crate) fn toggle_single_tool_run(&mut self, tool_call_id: &acp_v1::ToolCallId) {
+        if self.expanded_tool_calls.remove(tool_call_id) {
+            self.open_tool_runs.remove(tool_call_id);
+        } else {
+            self.expanded_tool_calls.insert(tool_call_id.clone());
+            self.open_tool_runs.insert(tool_call_id.clone());
+        }
+    }
+
     pub(crate) fn transcript_view(&self) -> TranscriptView {
         self.transcript_view
     }

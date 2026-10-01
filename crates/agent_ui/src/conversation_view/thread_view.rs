@@ -8456,7 +8456,7 @@ impl ThreadView {
         .collect()
     }
 
-    fn tool_summary_item(tool_call: &ToolCall, cx: &App) -> ToolSummaryItem {
+    pub(super) fn tool_summary_item(tool_call: &ToolCall, cx: &App) -> ToolSummaryItem {
         let has_diff = tool_call.content().iter().any(|content| {
             matches!(
                 content,
@@ -8466,13 +8466,31 @@ impl ThreadView {
             )
         });
         let verb = tool_run_summary::verb_for_kind(tool_call.kind(), has_diff);
+        // Agents don't always send a location; an edit still names its file in its diff.
         let file_name = || {
-            tool_call.locations.first().and_then(|location| {
-                location
-                    .path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
+            let path = tool_call
+                .locations
+                .first()
+                .map(|location| location.path.clone())
+                .or_else(|| {
+                    tool_call
+                        .content()
+                        .iter()
+                        .find_map(|content| match content {
+                            ToolCallContent::Diff(diff)
+                            | ToolCallContent::LegacyDiff { diff, .. } => {
+                                diff.read(cx).file_path(cx).map(std::path::PathBuf::from)
+                            }
+                            ToolCallContent::DiffPatch { source, .. } => source
+                                .changes
+                                .first()
+                                .and_then(acp_thread::diff_change_path)
+                                .map(|path| path.to_path_buf()),
+                            _ => None,
+                        })
+                })?;
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
         };
         let title =
             || tool_run_summary::short_subject(&tool_call.label.read(cx).source().replace('`', ""));
@@ -8544,6 +8562,13 @@ impl ThreadView {
         let first_id = first.id.clone();
         let is_open = self.entry_view_state.read(cx).is_tool_run_open(&first_id);
         let is_first = first_ix == entry_ix;
+        // A lone tool needs no list of members: its line opens straight to the tool.
+        let is_single = members.len() == 1;
+        let is_single_expanded = is_single
+            && self
+                .entry_view_state
+                .read(cx)
+                .is_tool_call_expanded(&first_id);
         if !is_open && !is_first {
             return Empty.into_any();
         }
@@ -8565,6 +8590,15 @@ impl ThreadView {
                 .iter()
                 .map(|(_, tool_call)| tool_call.id.clone())
                 .collect::<Vec<_>>();
+            let text = match items.as_slice() {
+                [only] => tool_run_summary::member_line(only),
+                _ => tool_run_summary::run_summary(&items),
+            };
+            let shows_open = if is_single {
+                is_single_expanded
+            } else {
+                is_open
+            };
             h_flex()
                 .id(("tool-run-summary", entry_ix))
                 .debug_selector(|| "tool-run-summary".into())
@@ -8574,7 +8608,7 @@ impl ThreadView {
                 .gap_1()
                 .cursor_pointer()
                 .child(
-                    Label::new(tool_run_summary::run_summary(&items))
+                    Label::new(text)
                         .size(LabelSize::Custom(self.tool_name_font_size()))
                         .color(Color::Muted)
                         .truncate(),
@@ -8594,7 +8628,7 @@ impl ThreadView {
                     )
                 })
                 .child(
-                    Icon::new(if is_open {
+                    Icon::new(if shows_open {
                         IconName::ChevronDown
                     } else {
                         IconName::ChevronRight
@@ -8604,7 +8638,11 @@ impl ThreadView {
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.entry_view_state.update(cx, |state, _| {
-                        state.toggle_tool_run(&first_id, &member_ids);
+                        if is_single {
+                            state.toggle_single_tool_run(&first_id);
+                        } else {
+                            state.toggle_tool_run(&first_id, &member_ids);
+                        }
                     });
                     this.list_state.remeasure_items(run.clone());
                     this.refresh_thread_search(window, cx);
@@ -8615,8 +8653,18 @@ impl ThreadView {
         v_flex()
             .w_full()
             .children(summary_line)
-            .when(is_open, |this| {
-                this.child(self.render_tool_run_member(entry_ix, tool_call, window, cx))
+            .map(|this| {
+                if is_single {
+                    this.when(is_single_expanded, |this| {
+                        this.child(
+                            self.render_standalone_tool_call(entry_ix, tool_call, window, cx),
+                        )
+                    })
+                } else {
+                    this.when(is_open, |this| {
+                        this.child(self.render_tool_run_member(entry_ix, tool_call, window, cx))
+                    })
+                }
             })
             .into_any()
     }

@@ -9018,6 +9018,56 @@ pub(crate) mod tests {
         assert!(cx.debug_bounds("thinking-block").is_some());
     }
 
+    #[gpui::test]
+    async fn test_lone_tool_call_opens_directly(cx: &mut TestAppContext) {
+        let updates = vec![acp_v1::SessionUpdate::ToolCall(finished_tool(
+            "run-tests",
+            acp_v1::ToolKind::Execute,
+            "cargo test",
+        ))];
+        let (_thread, cx) = setup_tool_run(updates, TranscriptView::Normal, cx).await;
+        let line = cx
+            .debug_bounds("tool-run-summary")
+            .expect("a lone tool call still folds into one line");
+        assert!(cx.debug_bounds("tool-call-output-1-0").is_none());
+
+        cx.simulate_click(line.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tool-run-member-1").is_none(),
+            "a lone tool call has no member line"
+        );
+        assert!(
+            cx.debug_bounds("tool-call-output-1-0").is_some(),
+            "its line opens straight to its output"
+        );
+
+        let line = cx.debug_bounds("tool-run-summary").expect("the line stays");
+        cx.simulate_click(line.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("tool-call-output-1-0").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_edit_without_location_names_its_file_from_its_diff(cx: &mut TestAppContext) {
+        let updates = vec![acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new("edit-plan", "Edit file")
+                .kind(acp_v1::ToolKind::Edit)
+                .status(acp_v1::ToolCallStatus::Completed)
+                .content(vec![acp_v1::ToolCallContent::Diff(
+                    acp_v1::Diff::new("/project/docs/plan.md", "new plan").old_text("old plan"),
+                )]),
+        )];
+        let (thread, cx) = setup_tool_run(updates, TranscriptView::Normal, cx).await;
+        let subject = thread.read_with(cx, |thread, cx| {
+            let (_, tool_call) = thread
+                .tool_call(&acp_v1::ToolCallId::new("edit-plan"))
+                .expect("edit tool call");
+            ThreadView::tool_summary_item(tool_call, cx).subject
+        });
+        assert_eq!(subject.as_deref(), Some("plan.md"));
+    }
+
     /// Card-centric tests check the verbose view; folding tests use the others.
     pub(crate) fn set_transcript_view(transcript_view: TranscriptView, cx: &mut App) {
         use gpui::UpdateGlobal as _;
