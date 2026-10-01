@@ -52,6 +52,8 @@ One transcript color, `secondary_text_color`: the theme's main text blended 70% 
 ## Changes made
 
 - `secondary_text_color` / `secondary_text_blend` (text at 70% over the panel background; about #969696 against #CCCCCC replies in M's theme) used for folded run and member lines, injected notice lines and the opened report, the thinking header and body, tool labels (card and non-card) and tool output. Test `test_secondary_text_sits_between_text_and_background` (dark theme with muted = text, and a light theme). `agent_ui` 503; clippy and rustfmt clean; debug build passes.
+- Follow-up (M: "make the reply pure white"): the reply is pure white on dark themes, theme text on light ones (`reply_text_color`, test `test_reply_is_pure_white_on_dark_themes_only`).
+- Correction: "markdown inherits its container's text color" was wrong. `MarkdownStyle::themed` sets `base_text_style.color` (markdown.rs:236) and painting reads it (markdown.rs:2642, 2729), so container colors never reached markdown; the thinking body, the opened report and tool output were not dimmed by the first change. The text color now goes into the markdown style: `render_message_content` and `render_output_content_block` take `text_color` (reply: reply color; thinking, report, compaction summary: secondary); `render_markdown_output` sets secondary in its style; the two no-op container colors were removed. `agent_ui` 504; clippy and rustfmt clean; debug build passes.
 
 ## Open questions
 

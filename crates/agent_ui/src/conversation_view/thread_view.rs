@@ -593,6 +593,20 @@ fn secondary_text_blend(text: Hsla, background: Hsla) -> Hsla {
     background.blend(text.opacity(SECONDARY_TEXT_OPACITY))
 }
 
+/// The agent's reply: pure white on a dark theme, so it stands out from the secondary text;
+/// a light theme keeps its own text color, which white would make unreadable.
+fn reply_text_color(cx: &App) -> Hsla {
+    reply_text_for(cx.theme().appearance(), cx.theme().colors().text)
+}
+
+fn reply_text_for(appearance: theme::Appearance, theme_text: Hsla) -> Hsla {
+    if appearance.is_light() {
+        theme_text
+    } else {
+        gpui::white()
+    }
+}
+
 fn transcript_view_label(transcript_view: TranscriptView) -> &'static str {
     match transcript_view {
         TranscriptView::Normal => "Normal",
@@ -4161,6 +4175,7 @@ impl ThreadView {
                                                     None,
                                                     true,
                                                     false,
+                                                    secondary_text_color(cx),
                                                     window,
                                                     cx,
                                                 )
@@ -6547,7 +6562,12 @@ impl ThreadView {
                                     div()
                                         .id(("assistant-message-chunk", chunk_ix))
                                         .child(self.render_message_content(
-                                            entry_ix, chunk_ix, block, window, cx,
+                                            entry_ix,
+                                            chunk_ix,
+                                            block,
+                                            reply_text_color(cx),
+                                            window,
+                                            cx,
                                         ))
                                         .into_any_element()
                                 })
@@ -7623,11 +7643,13 @@ impl ThreadView {
         cx.notify();
     }
 
+    /// Markdown takes its color from its style, so `text_color` is passed down to it.
     fn render_message_content(
         &self,
         entry_ix: usize,
         chunk_ix: usize,
         content: &acp_thread::MessageContent,
+        text_color: Hsla,
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
@@ -7645,6 +7667,7 @@ impl ThreadView {
                         None,
                         false,
                         collapse_code_blocks,
+                        text_color,
                         window,
                         cx,
                     );
@@ -7743,7 +7766,6 @@ impl ThreadView {
                         .child(
                             div()
                                 .id(("thinking-content", chunk_ix))
-                                .text_color(secondary_text_color(cx))
                                 .ml_1p5()
                                 .pl_3p5()
                                 .border_l_1()
@@ -7753,11 +7775,14 @@ impl ThreadView {
                                     this.track_scroll(&scroll_handle)
                                 })
                                 .overflow_hidden()
-                                .child(
-                                    self.render_message_content(
-                                        entry_ix, chunk_ix, chunk, window, cx,
-                                    ),
-                                ),
+                                .child(self.render_message_content(
+                                    entry_ix,
+                                    chunk_ix,
+                                    chunk,
+                                    secondary_text_color(cx),
+                                    window,
+                                    cx,
+                                )),
                         )
                         .when(is_constrained, |this| {
                             this.child(
@@ -8637,12 +8662,12 @@ impl ThreadView {
                                 .border_l_1()
                                 .border_color(self.tool_card_border_color(cx))
                                 .text_ui(cx)
-                                .text_color(secondary_text_color(cx))
                                 .debug_selector(move || format!("subagent-report-body-{entry_ix}"))
                                 .child(self.render_message_content(
                                     entry_ix,
                                     0,
                                     &message.content,
+                                    secondary_text_color(cx),
                                     window,
                                     cx,
                                 )),
@@ -11087,6 +11112,7 @@ impl ThreadView {
                 Some(tool_call),
                 card_layout,
                 false,
+                secondary_text_color(cx),
                 window,
                 cx,
             ),
@@ -11179,6 +11205,7 @@ impl ThreadView {
         }
     }
 
+    /// `text_color` colors markdown outside tool output; tool output uses the secondary color.
     fn render_output_content_block(
         &self,
         entry_ix: usize,
@@ -11187,6 +11214,7 @@ impl ThreadView {
         tool_call: Option<&ToolCall>,
         card_layout: bool,
         collapse_code_blocks: bool,
+        text_color: Hsla,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -11202,13 +11230,11 @@ impl ThreadView {
                     cx,
                 )
             } else {
-                self.render_markdown(
-                    markdown.clone(),
-                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                    cx,
-                )
-                .collapse_code_blocks(collapse_code_blocks)
-                .into_any()
+                let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                style.base_text_style.color = text_color;
+                self.render_markdown(markdown.clone(), style, cx)
+                    .collapse_code_blocks(collapse_code_blocks)
+                    .into_any()
             }
         } else if let Some((resource, _)) = content.embedded_resource() {
             if tool_call.is_some() {
@@ -11392,7 +11418,8 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let mut markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        markdown_style.base_text_style.color = secondary_text_color(cx);
         let line_height = markdown_style
             .base_text_style
             .line_height_in_pixels(window.rem_size());
@@ -13873,6 +13900,19 @@ mod tests {
     use std::path::Path;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_reply_is_pure_white_on_dark_themes_only() {
+        let theme_text = Hsla::from(gpui::rgb(0xcccccc));
+        assert_eq!(
+            reply_text_for(theme::Appearance::Dark, theme_text),
+            gpui::white()
+        );
+        assert_eq!(
+            reply_text_for(theme::Appearance::Light, theme_text),
+            theme_text
+        );
+    }
 
     #[test]
     fn test_secondary_text_sits_between_text_and_background() {
