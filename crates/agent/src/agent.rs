@@ -1,4 +1,5 @@
 mod db;
+mod hooks;
 mod legacy_thread;
 mod native_agent_server;
 pub mod outline;
@@ -2780,6 +2781,10 @@ pub fn available_native_agent(cx: &App) -> AvailableAgent {
 impl acp_thread::AgentConnection for NativeAgentConnection {
     fn agent_id(&self) -> AgentId {
         ZED_AGENT_ID.clone()
+    }
+
+    fn persists_draft_prompt(&self) -> bool {
+        true
     }
 
     fn telemetry_id(&self) -> SharedString {

@@ -54,6 +54,9 @@ actions!(
         Add,
         /// Opens a new agent thread with the branch diff for review.
         ReviewDiff,
+        /// Asks the agent to review the current branch's changes against the default branch for
+        /// bugs and security issues.
+        ReviewBranch,
         LeaderAndFollower,
         /// Compare with a specific branch
         CompareWithBranch,

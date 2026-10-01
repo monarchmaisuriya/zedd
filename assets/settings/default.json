@@ -1231,6 +1231,16 @@
     // (commands, paths, URLs, etc.). For `copy_path` and `move_path`,
     // patterns are matched independently against each path (source and
     // destination).
+    // Commands the native agent runs at points in its loop, read from user settings
+    // only. Each command receives the event as JSON on stdin. A failing pre_tool_use
+    // hook blocks the tool call, a failing user_prompt_submit hook blocks the prompt,
+    // a failing post_tool_use hook adds its output to the tool result, and a failing
+    // stop hook sends its output back to the agent once. Hooks never approve a tool
+    // call. Example:
+    // "hooks": {
+    //   "pre_tool_use": [{ "matcher": "^terminal$", "command": "~/bin/check-command" }],
+    //   "stop": [{ "command": "cargo check --quiet", "timeout_seconds": 120 }]
+    // },
     "tool_permissions": {
       // Global default permission when no tool-specific rules match.
       // "allow" - Auto-approve without prompting
@@ -2966,6 +2976,18 @@
   // }
   // Default: 60
   "context_server_timeout": 60,
+  // A command that checks the agent's work after each agent turn that used tools,
+  // run in the project root of trusted projects. When it fails, the agent is asked
+  // once to fix the failure. Set it per project in `.zed/settings.json`, e.g.
+  // "agent_verification": { "command": "cargo test" }
+  "agent_verification": {
+    // The shell command to run. Verification is off while this is null.
+    "command": null,
+    // How long the command may run before it counts as failed.
+    "timeout_seconds": 600,
+    // Whether new agent threads verify their turns. Each thread can switch it off.
+    "enabled_by_default": true,
+  },
   // Configures context servers for use by the agent.
   "context_servers": {},
   // Configures agent servers available in the agent panel.

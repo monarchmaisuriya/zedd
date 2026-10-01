@@ -1095,7 +1095,7 @@ impl ToolContentPatch {
     ) -> Result<Vec<PreparedToolCallContent>> {
         match self {
             Self::Legacy(content) => PreparedToolCallContent::prepare(content, terminals),
-            Self::Protocol(content) => PreparedToolCallContent::prepare_v2(content, terminals),
+            Self::Protocol(content) => Ok(PreparedToolCallContent::prepare_v2(content, terminals)),
         }
     }
 }
@@ -1176,6 +1176,15 @@ impl ToolCallPatch {
 }
 
 impl ToolCall {
+    /// The plan document an agent asks to leave plan mode with, when its request names one.
+    pub fn plan_file_path(&self) -> Option<PathBuf> {
+        if self.reported_kind != Some(acp_v2::ToolKind::SwitchMode) {
+            return None;
+        }
+        let path = PathBuf::from(self.raw_input.as_ref()?.get("planFilePath")?.as_str()?);
+        path.is_absolute().then_some(path)
+    }
+
     fn from_acp(
         tool_call: acp_v1::ToolCall,
         status: Option<ToolCallStatus>,
@@ -2860,6 +2869,9 @@ enum PreparedToolCallContent {
     },
     DiffPatch(acp_v2::Diff),
     Other(acp_v2::ToolCallContent),
+    /// A terminal this thread does not know, e.g. one from before a restart: the reference is
+    /// valid but its output is gone, so the rest of the update still applies.
+    UnavailableTerminal(acp_v2::ToolCallContent),
 }
 
 impl PreparedToolCallContent {
@@ -2876,12 +2888,14 @@ impl PreparedToolCallContent {
                 acp_v1::ToolCallContent::Diff(diff) => Self::LegacyDiff(diff),
                 acp_v1::ToolCallContent::Terminal(acp_v1::Terminal {
                     terminal_id, meta, ..
-                }) => Self::Terminal {
-                    terminal: terminals
-                        .get(&terminal_id)
-                        .cloned()
-                        .ok_or_else(|| anyhow!("Terminal with id `{terminal_id}` not found"))?,
-                    meta,
+                }) => match terminals.get(&terminal_id) {
+                    Some(terminal) => Self::Terminal {
+                        terminal: terminal.clone(),
+                        meta,
+                    },
+                    None => Self::unavailable_terminal(acp_v2::ToolCallContent::Terminal(
+                        acp_v2::Terminal::new(terminal_id.0).meta(meta),
+                    )),
                 },
                 _ => continue,
             };
@@ -2893,25 +2907,32 @@ impl PreparedToolCallContent {
     fn prepare_v2(
         content: Vec<acp_v2::ToolCallContent>,
         terminals: &HashMap<acp_v1::TerminalId, Entity<Terminal>>,
-    ) -> Result<Vec<Self>> {
+    ) -> Vec<Self> {
         content
             .into_iter()
             .map(|content| match content {
-                acp_v2::ToolCallContent::Content(content) => Ok(Self::ContentBlock(*content)),
-                acp_v2::ToolCallContent::Diff(diff) => Ok(Self::DiffPatch(diff)),
+                acp_v2::ToolCallContent::Content(content) => Self::ContentBlock(*content),
+                acp_v2::ToolCallContent::Diff(diff) => Self::DiffPatch(diff),
                 acp_v2::ToolCallContent::Terminal(terminal) => {
-                    let terminal_id = acp_v1::TerminalId::new(terminal.terminal_id.0);
-                    Ok(Self::Terminal {
-                        terminal: terminals
-                            .get(&terminal_id)
-                            .cloned()
-                            .ok_or_else(|| anyhow!("Terminal with id `{terminal_id}` not found"))?,
-                        meta: terminal.meta,
-                    })
+                    let terminal_id = acp_v1::TerminalId::new(terminal.terminal_id.0.clone());
+                    match terminals.get(&terminal_id) {
+                        Some(known) => Self::Terminal {
+                            terminal: known.clone(),
+                            meta: terminal.meta,
+                        },
+                        None => {
+                            Self::unavailable_terminal(acp_v2::ToolCallContent::Terminal(terminal))
+                        }
+                    }
                 }
-                other => Ok(Self::Other(other)),
+                other => Self::Other(other),
             })
             .collect()
+    }
+
+    fn unavailable_terminal(source: acp_v2::ToolCallContent) -> Self {
+        log::debug!("tool call references a terminal this thread does not know");
+        Self::UnavailableTerminal(source)
     }
 }
 
@@ -2964,6 +2985,14 @@ impl ToolCallContent {
                 source,
                 markdown: ContentBlock::create_markdown(
                     "Unsupported tool call content.".into(),
+                    language_registry,
+                    cx,
+                ),
+            },
+            PreparedToolCallContent::UnavailableTerminal(source) => Self::Other {
+                source,
+                markdown: ContentBlock::create_markdown(
+                    "Terminal output is no longer available.".into(),
                     language_registry,
                     cx,
                 ),
@@ -6132,24 +6161,47 @@ impl AcpThread {
                 anyhow::Ok(project.open_buffer(path, cx))
             });
             let buffer = load?.await?;
-            let snapshot = this.update(cx, |this, cx| {
-                this.shared_buffers
+            // The agent's content is merged against the buffer as the agent last saw it, so
+            // edits made since then survive. A change since then that touches a region the
+            // agent rewrites cannot be merged, and replaying the hunk would duplicate text.
+            let (base, live) = this.update(cx, |this, cx| {
+                let live = buffer.read(cx).snapshot();
+                let base = this
+                    .shared_buffers
                     .get(&buffer)
                     .cloned()
-                    .unwrap_or_else(|| buffer.read(cx).snapshot())
+                    .unwrap_or_else(|| live.clone());
+                (base, live)
             })?;
+            let display_path = path.display().to_string();
             let edits = cx
                 .background_executor()
                 .spawn(async move {
-                    let old_text = snapshot.text();
-                    text_diff(old_text.as_str(), &content)
-                        .into_iter()
-                        .map(|(range, replacement)| {
-                            (snapshot.anchor_range_inside(range), replacement)
-                        })
-                        .collect::<Vec<_>>()
+                    let hunks = text_diff(base.text().as_str(), &content);
+                    let changed_since_read = live
+                        .edits_since::<usize>(&base.version)
+                        .map(|edit| edit.old)
+                        .collect::<Vec<_>>();
+                    let conflicts = hunks.iter().any(|(range, _)| {
+                        changed_since_read
+                            .iter()
+                            .any(|old| range.start <= old.end && old.start <= range.end)
+                    });
+                    if conflicts {
+                        anyhow::bail!(
+                            "{display_path} changed since it was last read; read it again before writing"
+                        );
+                    }
+                    anyhow::Ok(
+                        hunks
+                            .into_iter()
+                            .map(|(range, replacement)| {
+                                (base.anchor_range_inside(range), replacement)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                 })
-                .await;
+                .await?;
 
             if should_update_agent_location {
                 project.update(cx, |project, cx| {
@@ -6203,6 +6255,12 @@ impl AcpThread {
                     action_log.buffer_edited(buffer.clone(), cx);
                 });
             }
+
+            // The agent now knows the file as this write left it, formatting included.
+            this.update(cx, |this, cx| {
+                this.shared_buffers
+                    .insert(buffer.clone(), buffer.read(cx).snapshot());
+            })?;
 
             project
                 .update(cx, |project, cx| project.save_buffer(buffer, cx))
@@ -7935,8 +7993,7 @@ mod tests {
             let prepared = PreparedToolCallContent::prepare_v2(
                 vec![make_content("first", "first")],
                 &HashMap::default(),
-            )
-            .expect("prepare content");
+            );
             let mut content = ToolCallContent::from_prepared(
                 prepared.into_iter().next().expect("content"),
                 &languages,
@@ -7946,8 +8003,7 @@ mod tests {
             let prepared = PreparedToolCallContent::prepare_v2(
                 vec![make_content("second", "second")],
                 &HashMap::default(),
-            )
-            .expect("prepare update");
+            );
             content.update_from_prepared(
                 prepared.into_iter().next().expect("update"),
                 &languages,
@@ -8253,8 +8309,7 @@ mod tests {
             let prepared = PreparedToolCallContent::prepare_v2(
                 vec![acp_v2::ToolCallContent::Diff(diff.clone()), unknown.clone()],
                 &HashMap::default(),
-            )
-            .expect("prepare v2 content");
+            );
             let mut content: Vec<_> = prepared
                 .into_iter()
                 .map(|content| ToolCallContent::from_prepared(content, &languages, cx))
@@ -10335,6 +10390,151 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_consecutive_writes_without_read_do_not_duplicate(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/tmp"), json!({"foo": "one\ntwo\nthree\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            move |_, thread, mut cx| {
+                async move {
+                    thread
+                        .update(&mut cx, |thread, cx| {
+                            thread.read_text_file(path!("/tmp/foo").into(), None, None, false, cx)
+                        })
+                        .unwrap()
+                        .await
+                        .unwrap();
+                    for content in ["one\ntwo\nthree\nfour\n", "one\ntwo\nthree\nfour\nfive\n"] {
+                        thread
+                            .update(&mut cx, |thread, cx| {
+                                thread.write_text_file(
+                                    path!("/tmp/foo").into(),
+                                    content.to_string(),
+                                    cx,
+                                )
+                            })
+                            .unwrap()
+                            .await
+                            .unwrap();
+                    }
+                    Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn))
+                }
+                .boxed_local()
+            },
+        ));
+
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/tmp/foo"), true, cx)
+            })
+            .await
+            .unwrap();
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/tmp"))]), cx)
+            })
+            .await
+            .unwrap();
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Extend the count", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            String::from_utf8(fs.read_file_sync(path!("/tmp/foo")).unwrap()).unwrap(),
+            "one\ntwo\nthree\nfour\nfive\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_write_rejects_change_overlapping_since_read(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/tmp"), json!({"foo": "one\ntwo\nthree\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (read_file_tx, read_file_rx) = oneshot::channel::<()>();
+        let read_file_tx = Rc::new(RefCell::new(Some(read_file_tx)));
+        let (user_edited_tx, user_edited_rx) = oneshot::channel::<()>();
+        let user_edited_rx = Rc::new(RefCell::new(Some(user_edited_rx)));
+        let (write_result_tx, write_result_rx) = oneshot::channel::<Result<()>>();
+        let write_result_tx = Rc::new(RefCell::new(Some(write_result_tx)));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            move |_, thread, mut cx| {
+                let read_file_tx = read_file_tx.clone();
+                let user_edited_rx = user_edited_rx.clone();
+                let write_result_tx = write_result_tx.clone();
+                async move {
+                    thread
+                        .update(&mut cx, |thread, cx| {
+                            thread.read_text_file(path!("/tmp/foo").into(), None, None, false, cx)
+                        })
+                        .unwrap()
+                        .await
+                        .unwrap();
+                    read_file_tx.take().unwrap().send(()).unwrap();
+                    user_edited_rx.take().unwrap().await.unwrap();
+                    let result = thread
+                        .update(&mut cx, |thread, cx| {
+                            thread.write_text_file(
+                                path!("/tmp/foo").into(),
+                                "one\nTWO\nthree\n".to_string(),
+                                cx,
+                            )
+                        })
+                        .unwrap()
+                        .await;
+                    write_result_tx.take().unwrap().send(result).ok();
+                    Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn))
+                }
+                .boxed_local()
+            },
+        ));
+
+        let (worktree, pathbuf) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/tmp/foo"), true, cx)
+            })
+            .await
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree.read(cx).id(), pathbuf), cx)
+            })
+            .await
+            .unwrap();
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/tmp"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let request = thread.update(cx, |thread, cx| thread.send_raw("Capitalize two", cx));
+        read_file_rx.await.ok();
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(4..7, "TWO".to_string())], None, cx);
+        });
+        user_edited_tx.send(()).unwrap();
+        let write_result = write_result_rx.await.unwrap();
+        let error = write_result.expect_err("an overlapping change must not be merged");
+        assert!(
+            error.to_string().contains("changed since it was last read"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "one\nTWO\nthree\n"
+        );
+        request.await.unwrap();
+    }
+
+    #[gpui::test]
     async fn test_reading_from_line(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -11423,18 +11623,18 @@ mod tests {
             })
             .expect("second request");
         thread.update(cx, |thread, cx| {
-            let original_label = thread.tool_call(&id).expect("tool").1.label.clone();
-            let result = thread.upsert_tool_call_patch(
-                serde_json::from_value(json!({
-                    "toolCallId": "permission",
-                    "status": "cancelled",
-                    "title": "must not replace valid presentation",
-                    "content": [{"type": "terminal", "terminalId": "missing"}]
-                }))
-                .expect("cancelled patch"),
-                cx,
-            );
-            assert!(result.is_err());
+            thread
+                .upsert_tool_call_patch(
+                    serde_json::from_value(json!({
+                        "toolCallId": "permission",
+                        "status": "cancelled",
+                        "title": "Cancelled command",
+                        "content": [{"type": "terminal", "terminalId": "missing"}]
+                    }))
+                    .expect("cancelled patch"),
+                    cx,
+                )
+                .expect("an unknown terminal is not an invalid patch");
             let (_, call) = thread.tool_call(&id).expect("tool");
             assert_eq!(
                 call.reported_status,
@@ -11442,8 +11642,7 @@ mod tests {
             );
             assert_eq!(call.status(), ToolCallStatus::Canceled);
             assert!(call.authorization().is_none());
-            assert_eq!(call.label, original_label);
-            assert_eq!(call.label.read(cx).source(), "Authorize");
+            assert_eq!(call.label.read(cx).source(), "Cancelled command");
         });
         assert!(matches!(
             permission.await,
@@ -11606,6 +11805,57 @@ mod tests {
             assert!(call.locations.is_empty());
             assert!(call.resolved_locations.is_empty());
             assert!(thread.project.read(cx).agent_location().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_plan_file_path_is_read_from_plan_mode_exit_requests(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let request = |id: &str, kind: acp_v1::ToolKind, plan_path: &str| {
+            acp_v1::ToolCall::new(acp_v1::ToolCallId::new(id), "Ready to code?")
+                .kind(kind)
+                .raw_input(json!({ "plan": "1. Do it", "planFilePath": plan_path }))
+        };
+        let plan_path = path!("/home/user/.claude/plans/plan.md");
+
+        thread.update(cx, |thread, cx| {
+            let mut permissions = Vec::new();
+            for tool_call in [
+                request("exit", acp_v1::ToolKind::SwitchMode, plan_path),
+                request("relative", acp_v1::ToolKind::SwitchMode, "plans/plan.md"),
+                request("other-kind", acp_v1::ToolKind::Edit, plan_path),
+            ] {
+                let permission = thread
+                    .request_tool_call_authorization(
+                        tool_call.into(),
+                        PermissionOptions::Flat(vec![acp_v1::PermissionOption::new(
+                            "allow",
+                            "Allow",
+                            acp_v1::PermissionOptionKind::AllowOnce,
+                        )]),
+                        AuthorizationKind::PermissionGrant,
+                        cx,
+                    )
+                    .expect("permission request");
+                permissions.push(permission);
+            }
+            let plan_file = |id: &str| {
+                thread
+                    .tool_call(&acp_v1::ToolCallId::new(id))
+                    .and_then(|(_, tool_call)| tool_call.plan_file_path())
+            };
+            assert_eq!(plan_file("exit"), Some(PathBuf::from(plan_path)));
+            assert_eq!(
+                plan_file("relative"),
+                None,
+                "only absolute paths are opened"
+            );
+            assert_eq!(
+                plan_file("other-kind"),
+                None,
+                "only plan-mode exits carry a plan"
+            );
         });
     }
 
@@ -12238,27 +12488,28 @@ mod tests {
             assert_eq!(call.raw_input, Some(serde_json::Value::Null));
             assert_eq!(call.content().len(), 1);
             assert_eq!(call.content()[0].to_markdown(cx), "raw fallback");
-            assert!(
-                call.update_fields(
-                    acp_v1::ToolCallUpdateFields::new().content(vec![
-                        "partial output".into(),
-                        acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new("missing")),
-                    ]),
-                    None,
-                    languages,
-                    &terminals,
-                    cx,
-                )
-                .is_err()
+            call.update_fields(
+                acp_v1::ToolCallUpdateFields::new().content(vec![
+                    "partial output".into(),
+                    acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new("missing")),
+                ]),
+                None,
+                languages,
+                &terminals,
+                cx,
+            )
+            .expect("an unknown terminal is not an invalid update");
+            assert_eq!(call.content().len(), 2);
+            assert_eq!(call.content()[0].to_markdown(cx), "partial output");
+            assert_eq!(
+                call.content()[1].to_markdown(cx),
+                "Terminal output is no longer available."
             );
-            assert!(call.structured_content.is_empty());
-            assert_eq!(call.content().len(), 1);
-            assert_eq!(call.content()[0].to_markdown(cx), "raw fallback");
         });
     }
 
     #[gpui::test]
-    async fn test_tool_patch_retries_creation_and_does_not_relabel_terminal_on_error(
+    async fn test_unknown_terminal_shows_placeholder_until_the_terminal_arrives(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -12271,8 +12522,15 @@ mod tests {
                 acp_v1::Terminal::new(terminal_id.clone()),
             )]);
         thread.update(cx, |thread, cx| {
-            assert!(thread.upsert_tool_call(initial.clone(), cx).is_err());
-            assert!(thread.entries().is_empty());
+            thread
+                .upsert_tool_call(initial.clone(), cx)
+                .expect("a tool call naming an unknown terminal is still created");
+            let (_, call) = thread.tool_call(&id).expect("tool");
+            assert!(call.terminals().next().is_none());
+            assert_eq!(
+                call.content()[0].to_markdown(cx),
+                "Terminal output is no longer available."
+            );
         });
         let lower = cx.new(|cx| {
             ::terminal::TerminalBuilder::new_display_only(
@@ -12298,60 +12556,42 @@ mod tests {
             );
             thread
                 .upsert_tool_call(initial, cx)
-                .expect("retry after terminal arrives");
+                .expect("upsert once the terminal arrives");
             let terminal = thread.terminal(terminal_id.clone()).expect("terminal");
             let command = terminal.read(cx).command().clone();
             let (_, call) = thread.tool_call(&id).expect("tool");
             assert_eq!(call.terminals().next(), Some(&terminal));
             assert_eq!(thread.entries().len(), 1);
-            assert!(
-                thread
-                    .update_tool_call(
-                        acp_v1::ToolCallUpdate::new(
-                            id.clone(),
-                            acp_v1::ToolCallUpdateFields::new()
-                                .title("changed command")
-                                .content(vec![
-                                    acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
-                                        terminal_id.clone()
-                                    )),
-                                    acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
-                                        "missing"
-                                    )),
-                                ]),
-                        ),
-                        cx,
-                    )
-                    .is_err()
-            );
-            assert_eq!(command.read(cx).source(), "```\noriginal command\n```");
-            let (_, call) = thread.tool_call(&id).expect("unchanged tool");
-            assert_eq!(call.label.read(cx).source(), "Tool caption");
-            assert_eq!(call.terminals().next(), Some(&terminal));
-            assert_eq!(call.content().len(), 1);
+
             thread
                 .update_tool_call(
                     acp_v1::ToolCallUpdate::new(
                         id.clone(),
                         acp_v1::ToolCallUpdateFields::new()
                             .title("changed command")
-                            .content(vec![acp_v1::ToolCallContent::Terminal(
-                                acp_v1::Terminal::new(terminal_id),
-                            )]),
+                            .content(vec![
+                                acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
+                                    terminal_id.clone(),
+                                )),
+                                acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new("missing")),
+                            ]),
                     ),
                     cx,
                 )
-                .expect("valid terminal update");
+                .expect("an unknown terminal is not an invalid update");
             assert_eq!(command.read(cx).source(), "```\nchanged command\n```");
+            let (_, call) = thread.tool_call(&id).expect("tool");
+            assert_eq!(call.terminals().next(), Some(&terminal));
+            assert_eq!(call.content().len(), 2);
             assert_eq!(
-                thread.tool_call(&id).expect("tool").1.terminals().next(),
-                Some(&terminal)
+                call.content()[1].to_markdown(cx),
+                "Terminal output is no longer available."
             );
         });
     }
 
     #[gpui::test]
-    async fn test_failed_tool_patch_preserves_presentation_but_applies_status(
+    async fn test_tool_patch_with_unknown_terminal_applies_presentation_and_status(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -12384,14 +12624,6 @@ mod tests {
                 })
                 .expect("permission request");
             thread.update(cx, |thread, cx| {
-                let (_, call) = thread.tool_call(&id).expect("original tool");
-                let label = call.label.clone();
-                let original_content = match &call.content()[0] {
-                    ToolCallContent::ContentBlock { block, .. } => {
-                        block.markdown().expect("text").clone()
-                    }
-                    _ => panic!("text content"),
-                };
                 let update = acp_v1::ToolCallUpdate::new(
                     id.clone(),
                     acp_v1::ToolCallUpdateFields::new()
@@ -12417,21 +12649,32 @@ mod tests {
                 } else {
                     thread.update_tool_call(update, cx)
                 };
-                assert!(result.is_err(), "unknown terminal must fail conversion");
+                result.expect("an unknown terminal is not an invalid update");
                 let (_, call) = thread.tool_call(&id).expect("tool must remain");
                 assert_eq!(call.permission_status(), Some(status));
-                assert_eq!(call.label, label);
-                assert_eq!(call.label.read(cx).source(), "Original title");
-                assert_eq!(call.kind(), &acp_v2::ToolKind::Read);
-                assert_eq!(call.tool_name.as_deref(), Some("original-tool"));
-                assert_eq!(call.raw_input, Some(json!({"original": true})));
-                assert_eq!(call.raw_output, Some(json!("original raw")));
-                assert!(call.subagent_session_info.is_none());
-                assert_eq!(original_content.read(cx).source(), "original output");
-                let [ToolCallContent::ContentBlock { block, .. }] = call.content() else {
-                    panic!("original content must remain");
+                assert_eq!(call.label.read(cx).source(), "Changed title");
+                assert_eq!(call.kind(), &acp_v2::ToolKind::Execute);
+                assert_eq!(call.tool_name.as_deref(), Some("changed-tool"));
+                assert_eq!(call.raw_input, Some(json!({"changed": true})));
+                assert_eq!(call.raw_output, Some(json!("changed raw")));
+                assert!(call.subagent_session_info.is_some());
+                let [
+                    ToolCallContent::ContentBlock { block, .. },
+                    ToolCallContent::Other { markdown, .. },
+                ] = call.content()
+                else {
+                    panic!("text content followed by the unavailable terminal");
                 };
-                assert_eq!(block.markdown(), Some(&original_content));
+                assert_eq!(
+                    block
+                        .markdown()
+                        .map(|markdown| markdown.read(cx).source().to_string()),
+                    Some("changed output".to_string())
+                );
+                assert_eq!(
+                    markdown.read(cx).source(),
+                    "Terminal output is no longer available."
+                );
                 if status == acp_v1::ToolCallStatus::InProgress {
                     assert!(matches!(
                         call.status(),
@@ -12471,7 +12714,7 @@ mod tests {
                         ),
                         cx,
                     )
-                    .expect("valid correction after failed patch");
+                    .expect("valid correction");
                 let (_, call) = thread.tool_call(&id).expect("corrected tool");
                 assert!(matches!(call.status(), ToolCallStatus::Completed));
                 assert_eq!(call.content()[0].to_markdown(cx), "corrected output");
@@ -17674,17 +17917,23 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_failed_tool_update_resumes_sleep_prevention(cx: &mut TestAppContext) {
-        assert_failed_tool_update_resumes_sleep_prevention(false, cx).await;
+    async fn test_tool_update_with_unknown_terminal_resumes_sleep_prevention(
+        cx: &mut TestAppContext,
+    ) {
+        assert_completing_with_unknown_terminal_resumes_sleep_prevention(false, cx).await;
     }
 
     #[gpui::test]
-    async fn test_failed_tool_upsert_resumes_sleep_prevention(cx: &mut TestAppContext) {
-        assert_failed_tool_update_resumes_sleep_prevention(true, cx).await;
+    async fn test_tool_upsert_with_unknown_terminal_resumes_sleep_prevention(
+        cx: &mut TestAppContext,
+    ) {
+        assert_completing_with_unknown_terminal_resumes_sleep_prevention(true, cx).await;
     }
 
     #[gpui::test]
-    async fn test_failed_v2_terminal_patch_settles_only_its_permission(cx: &mut TestAppContext) {
+    async fn test_v2_patch_with_unknown_terminal_settles_only_its_permission(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         for status in [
             acp_v2::ToolCallStatus::Completed,
@@ -17712,26 +17961,22 @@ mod tests {
                 })
             });
             let first_index = thread.update(cx, |thread, cx| {
-                let (index, first) = thread.tool_call(&first_id).expect("first tool");
-                let original_label = first.label.clone();
-                assert!(
-                    thread
-                        .upsert_tool_call_patch(
-                            acp_v2::ToolCallUpdate::new("first")
-                                .status(status.clone())
-                                .title("invalid replacement")
-                                .content(vec![acp_v2::ToolCallContent::Terminal(
-                                    acp_v2::Terminal::new("missing")
-                                )]),
-                            cx,
-                        )
-                        .is_err()
-                );
+                let (index, _) = thread.tool_call(&first_id).expect("first tool");
+                thread
+                    .upsert_tool_call_patch(
+                        acp_v2::ToolCallUpdate::new("first")
+                            .status(status.clone())
+                            .title("Patched title")
+                            .content(vec![acp_v2::ToolCallContent::Terminal(
+                                acp_v2::Terminal::new("missing"),
+                            )]),
+                        cx,
+                    )
+                    .expect("an unknown terminal is not an invalid patch");
                 let (_, first) = thread.tool_call(&first_id).expect("updated tool");
                 assert_eq!(first.reported_status.as_ref(), Some(&status));
                 assert!(first.authorization().is_none());
-                assert_eq!(first.label, original_label);
-                assert_eq!(first.label.read(cx).source(), "Needs permission");
+                assert_eq!(first.label.read(cx).source(), "Patched title");
                 assert!(
                     thread
                         .tool_call(&second_id)
@@ -17946,7 +18191,7 @@ mod tests {
         }
     }
 
-    async fn assert_failed_tool_update_resumes_sleep_prevention(
+    async fn assert_completing_with_unknown_terminal_resumes_sleep_prevention(
         upsert: bool,
         cx: &mut TestAppContext,
     ) {
@@ -17971,20 +18216,13 @@ mod tests {
                     )]),
             );
             if upsert {
-                assert!(
-                    thread
-                        .upsert_tool_call_inner(update, Some(ToolCallStatus::Completed), cx)
-                        .is_err()
-                );
+                thread
+                    .upsert_tool_call_inner(update, Some(ToolCallStatus::Completed), cx)
+                    .expect("an unknown terminal is not an invalid upsert");
             } else {
-                assert_eq!(
-                    thread
-                        .update_tool_call(update, cx)
-                        .map_err(|error| error.to_string()),
-                    Err(String::from(
-                        "Terminal with id `unknown-terminal` not found"
-                    ))
-                );
+                thread
+                    .update_tool_call(update, cx)
+                    .expect("an unknown terminal is not an invalid update");
             }
             assert_eq!(
                 thread

@@ -44,7 +44,10 @@ use util::path_list::PathList;
 use util::process::Child;
 
 use anyhow::{Context as _, Result};
-use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
+use gpui::{
+    App, AppContext as _, AsyncApp, BackgroundExecutor, Entity, SharedString, Subscription, Task,
+    WeakEntity,
+};
 
 use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
@@ -55,6 +58,8 @@ use crate::{CURSOR_ID, GEMINI_ID};
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long an agent gets to exit after SIGTERM before its process group is killed.
+const AGENT_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn exited_load_error_after_drain(
     status: ExitStatus,
@@ -286,6 +291,7 @@ pub struct AcpConnection {
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
+    background_executor: BackgroundExecutor,
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
@@ -294,6 +300,8 @@ pub struct AcpConnection {
     _dispatch_task: Task<()>,
     _wait_task: Task<Result<()>>,
     _stderr_task: Shared<Task<()>>,
+    /// Resolves when the agent process exits or the transport closes.
+    closed: Option<Shared<Task<()>>>,
 }
 
 #[derive(Clone, Default)]
@@ -732,10 +740,12 @@ impl AcpConnection {
         let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
         let connection_future =
             connect_client_future("zed", transport, dispatch_tx.clone(), connection_tx);
+        let (transport_closed_tx, transport_closed_rx) = futures::channel::oneshot::channel();
         let io_task = cx.background_spawn(async move {
             if let Err(err) = connection_future.await {
                 log::error!("ACP connection error: {err}");
             }
+            transport_closed_tx.send(()).ok();
         });
 
         let connection_rx = async move {
@@ -849,6 +859,7 @@ impl AcpConnection {
             return Err(UnsupportedVersion.into());
         }
 
+        let (process_exited_tx, process_exited_rx) = futures::channel::oneshot::channel();
         let wait_task = cx.spawn({
             let sessions = sessions.clone();
             let debug_log = debug_log.clone();
@@ -857,9 +868,16 @@ impl AcpConnection {
                 let load_error =
                     exited_load_error_after_drain(status, drained, &debug_log, cx).await;
                 emit_load_error_to_all_sessions(&sessions, load_error, cx);
+                process_exited_tx.send(()).ok();
                 anyhow::Ok(())
             }
         });
+        // A dropped sender also counts: the task that watches for the end has itself ended.
+        let closed = cx
+            .background_spawn(async move {
+                futures::future::select(transport_closed_rx, process_exited_rx).await;
+            })
+            .shared();
 
         let agent_info = response.agent_info;
         let reads_air_fork_points = agent_info
@@ -942,8 +960,10 @@ impl AcpConnection {
             dispatch_tx,
             _dispatch_task: dispatch_task,
             _wait_task: wait_task,
+            closed: Some(closed),
             _stderr_task: stderr_task,
             child: Some(child),
+            background_executor: cx.background_executor().clone(),
         })
     }
 
@@ -989,6 +1009,8 @@ impl AcpConnection {
             _dispatch_task: dispatch_task,
             _wait_task: Task::ready(Ok(())),
             _stderr_task: Task::ready(()).shared(),
+            closed: None,
+            background_executor: cx.background_executor().clone(),
         }
     }
 
@@ -1508,8 +1530,11 @@ fn emit_load_error_to_all_sessions(
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
-            child.kill().log_err();
+        if let Some(child) = self.child.take() {
+            let grace = self.background_executor.timer(AGENT_TERMINATION_GRACE);
+            self.background_executor
+                .spawn(child.terminate_gracefully(grace))
+                .detach();
         }
     }
 }
@@ -1564,6 +1589,10 @@ fn meta_terminal_auth_task(
 impl AgentConnection for AcpConnection {
     fn agent_id(&self) -> AgentId {
         self.id.clone()
+    }
+
+    fn closed(&self) -> Option<Shared<Task<()>>> {
+        self.closed.clone()
     }
 
     fn telemetry_id(&self) -> SharedString {
@@ -2129,23 +2158,25 @@ pub mod test_support {
                     .lock()
                     .expect("exit status sender lock should not be poisoned") = Some(exit_tx);
                 let connection = harness.connection.clone();
-                let simulate_exit_task = cx.spawn(async move |cx| {
-                    while let Ok(status) = exit_rx.recv().await {
-                        emit_load_error_to_all_sessions(
-                            &connection.sessions,
-                            LoadError::Exited {
-                                status,
-                                stderr: None,
-                            },
-                            cx,
-                        );
-                    }
-                    Ok(())
-                });
+                // A process exits once, so the simulated exit also ends the connection.
+                let simulated_exit = cx
+                    .spawn(async move |cx| {
+                        if let Ok(status) = exit_rx.recv().await {
+                            emit_load_error_to_all_sessions(
+                                &connection.sessions,
+                                LoadError::Exited {
+                                    status,
+                                    stderr: None,
+                                },
+                                cx,
+                            );
+                        }
+                    })
+                    .shared();
                 Ok(Rc::new(FakeAcpAgentConnection {
                     inner: harness.connection,
                     _keep_agent_alive: harness.keep_agent_alive,
-                    _simulate_exit_task: simulate_exit_task,
+                    simulated_exit,
                 }) as Rc<dyn AgentConnection>)
             })
         }
@@ -2167,12 +2198,16 @@ pub mod test_support {
     struct FakeAcpAgentConnection {
         inner: Rc<AcpConnection>,
         _keep_agent_alive: Task<anyhow::Result<()>>,
-        _simulate_exit_task: Task<anyhow::Result<()>>,
+        simulated_exit: Shared<Task<()>>,
     }
 
     impl AgentConnection for FakeAcpAgentConnection {
         fn agent_id(&self) -> AgentId {
             self.inner.agent_id()
+        }
+
+        fn closed(&self) -> Option<Shared<Task<()>>> {
+            Some(self.simulated_exit.clone())
         }
 
         fn telemetry_id(&self) -> SharedString {

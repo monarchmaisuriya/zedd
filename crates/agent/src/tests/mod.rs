@@ -811,6 +811,207 @@ async fn test_prompt_caching(cx: &mut TestAppContext) {
     );
 }
 
+fn hook(matcher: Option<&str>, command: &str) -> settings::AgentHookContent {
+    settings::AgentHookContent {
+        matcher: matcher.map(ToString::to_string),
+        command: command.to_string(),
+        timeout_seconds: None,
+    }
+}
+
+fn set_agent_hooks(hooks: settings::AgentHooksContent, cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        use gpui::UpdateGlobal as _;
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.agent.get_or_insert_default().hooks = Some(hooks);
+            });
+        });
+    });
+}
+
+/// Hooks are real processes, so this waits on the wall clock until `done` holds.
+fn wait_for_hooks(cx: &mut TestAppContext, mut done: impl FnMut(&mut TestAppContext) -> bool) {
+    for _ in 0..500 {
+        cx.run_until_parked();
+        if done(cx) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("hooks did not finish");
+}
+
+#[gpui::test]
+async fn test_failing_prompt_hook_blocks_the_prompt(cx: &mut TestAppContext) {
+    let ThreadTest { thread, fake, .. } = setup(cx, TestModel::Fake).await;
+    set_agent_hooks(
+        settings::AgentHooksContent {
+            user_prompt_submit: Some(vec![hook(None, "echo no secrets >&2; exit 1")]),
+            ..Default::default()
+        },
+        cx,
+    );
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["my password is hunter2"], cx)
+        })
+        .unwrap();
+    let mut error = None;
+    wait_for_hooks(cx, |_| {
+        while let Ok(event) = events.try_recv() {
+            if let Err(event_error) = event {
+                error = Some(event_error.to_string());
+            }
+        }
+        error.is_some()
+    });
+
+    assert_eq!(
+        error.as_deref(),
+        Some(
+            "Prompt blocked by hook `echo no secrets >&2; exit 1` failed with exit code 1: no secrets"
+        )
+    );
+    assert!(
+        fake.pending_completions().is_empty(),
+        "the model never sees a blocked prompt"
+    );
+    thread.read_with(cx, |thread, _| {
+        assert!(
+            thread.last_message().is_none(),
+            "a blocked prompt leaves the thread"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_failing_stop_hook_gets_one_more_turn(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fake,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    set_agent_hooks(
+        settings::AgentHooksContent {
+            stop: Some(vec![hook(None, "echo run the tests >&2; exit 1")]),
+            ..Default::default()
+        },
+        cx,
+    );
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Change it"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_event(&model, LanguageModelCompletionEvent::Text("Changed".into()));
+    fake.end_last(&model);
+
+    let mut completion = None;
+    wait_for_hooks(cx, |_| {
+        completion = fake.pending_completions().pop();
+        completion.is_some()
+    });
+    let feedback = completion
+        .unwrap()
+        .messages
+        .last()
+        .map(|message| message.string_contents())
+        .unwrap_or_default();
+    assert!(
+        feedback.contains("run the tests"),
+        "the stop hook's output goes back to the agent, got {feedback:?}"
+    );
+
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::Text("Ran them".into()),
+    );
+    fake.end_last(&model);
+    cx.run_until_parked();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    assert!(
+        fake.pending_completions().is_empty(),
+        "a stop hook gets one more turn, not a loop"
+    );
+}
+
+#[gpui::test]
+async fn test_failing_pre_tool_hook_blocks_the_tool_call(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        thread,
+        fake,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    set_agent_hooks(
+        settings::AgentHooksContent {
+            pre_tool_use: Some(vec![
+                hook(Some("^echo$"), "cat > /dev/null"),
+                hook(Some("^echo$"), "echo not allowed >&2; exit 1"),
+                hook(Some("^never$"), "exit 1"),
+            ]),
+            ..Default::default()
+        },
+        cx,
+    );
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.add_tool(EchoTool);
+            thread.send(ClientUserMessageId::new(), ["Use the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "tool_1".into(),
+            name: EchoTool::NAME.into(),
+            raw_input: json!({"text": "test"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"text": "test"})),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&model);
+
+    // The hooks are real processes, so wait for the follow-up request on the wall clock.
+    let mut completion = None;
+    for _ in 0..500 {
+        cx.run_until_parked();
+        completion = fake.pending_completions().pop();
+        if completion.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let completion = completion.expect("the agent should continue after the blocked call");
+    let Some(MessageContent::ToolResult(result)) = completion
+        .messages
+        .last()
+        .and_then(|message| message.content.first())
+    else {
+        panic!(
+            "expected a tool result, got {:?}",
+            completion.messages.last()
+        );
+    };
+    assert!(result.is_error);
+    assert_eq!(
+        result.content,
+        vec![
+            "Blocked by hook `echo not allowed >&2; exit 1` failed with exit code 1: not allowed"
+                .into()
+        ]
+    );
+}
+
 #[gpui::test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 async fn test_basic_tool_calls(cx: &mut TestAppContext) {

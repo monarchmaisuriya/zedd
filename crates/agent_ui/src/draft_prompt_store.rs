@@ -8,6 +8,7 @@
 //! alongside the storage so the sidebar's preview rendering can't drift from
 //! the format we persist.
 
+use acp_thread::AcpThread;
 use agent::ZED_AGENT_ID;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
@@ -26,6 +27,12 @@ const NAMESPACE: &str = "agent_draft_prompts";
 
 /// Maximum length (in characters) of a draft label rendered in the sidebar.
 const MAX_LABEL_CHARS: usize = 250;
+
+/// Whether this store keeps the thread's unsent prompt: always before the agent has a session,
+/// and afterwards for agents that do not save it themselves.
+pub fn store_owns_draft(thread: &AcpThread) -> bool {
+    thread.is_draft_thread() || !thread.connection().persists_draft_prompt()
+}
 
 pub fn read(thread_id: ThreadId, cx: &App) -> Option<Vec<acp::ContentBlock>> {
     let kvp = KeyValueStore::global(cx);

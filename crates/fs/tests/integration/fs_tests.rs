@@ -508,6 +508,117 @@ async fn test_realfs_atomic_write_non_existing_file(executor: BackgroundExecutor
 }
 
 #[gpui::test]
+#[cfg(unix)]
+async fn test_realfs_save_replaces_file_without_touching_old_contents(
+    executor: BackgroundExecutor,
+) {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    executor.allow_parking();
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("file.txt");
+    std::fs::write(&path, "old").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let old_inode = std::fs::metadata(&path).unwrap().ino();
+    let mut old_handle = std::fs::File::open(&path).unwrap();
+
+    fs.save(&path, &rope::Rope::from("new"), text::LineEnding::Unix)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+    assert_ne!(
+        metadata.ino(),
+        old_inode,
+        "the new contents should arrive by rename"
+    );
+    let mut old_contents = String::new();
+    old_handle.read_to_string(&mut old_contents).unwrap();
+    assert_eq!(
+        old_contents, "old",
+        "the original file must never be truncated or overwritten in place"
+    );
+}
+
+#[gpui::test]
+#[cfg(unix)]
+async fn test_realfs_save_writes_hard_linked_file_in_place(executor: BackgroundExecutor) {
+    executor.allow_parking();
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("file.txt");
+    let link = temp_dir.path().join("link.txt");
+    std::fs::write(&path, "old").unwrap();
+    std::fs::hard_link(&path, &link).unwrap();
+
+    fs.save(&path, &rope::Rope::from("new"), text::LineEnding::Unix)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    assert_eq!(
+        std::fs::read_to_string(&link).unwrap(),
+        "new",
+        "a rename would split the hard link, so the file must be written in place"
+    );
+}
+
+#[gpui::test]
+#[cfg(unix)]
+async fn test_realfs_save_through_symlink_keeps_link(executor: BackgroundExecutor) {
+    executor.allow_parking();
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let target = temp_dir.path().join("target.txt");
+    let link = temp_dir.path().join("link.txt");
+    std::fs::write(&target, "old").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    fs.save(&link, &rope::Rope::from("new"), text::LineEnding::Unix)
+        .await
+        .unwrap();
+
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+}
+
+#[gpui::test]
+#[cfg(unix)]
+async fn test_realfs_save_refuses_read_only_file(executor: BackgroundExecutor) {
+    use std::os::unix::fs::PermissionsExt;
+
+    executor.allow_parking();
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("file.txt");
+    std::fs::write(&path, "old").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let result = fs
+        .save(&path, &rope::Rope::from("new"), text::LineEnding::Unix)
+        .await;
+
+    assert!(result.is_err(), "a read-only file must not be replaced");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+}
+
+#[gpui::test]
+async fn test_realfs_write_creates_missing_file(executor: BackgroundExecutor) {
+    executor.allow_parking();
+    let fs = RealFs::new(None, executor);
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("dir").join("file.txt");
+
+    fs.write(&path, b"new").await.unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+}
+
+#[gpui::test]
 #[cfg(target_os = "windows")]
 async fn test_realfs_canonicalize(executor: BackgroundExecutor) {
     use util::paths::SanitizedPath;

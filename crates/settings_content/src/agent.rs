@@ -450,6 +450,38 @@ pub struct AgentSettingsContent {
     /// These are populated when choosing "Allow always" from a sandbox
     /// escalation prompt.
     pub sandbox_permissions: Option<SandboxPermissionsContent>,
+
+    /// Commands the native agent runs at points in its loop. Each command receives the event as
+    /// JSON on stdin. Hooks never approve a tool call; Zed's permission prompt still applies.
+    pub hooks: Option<AgentHooksContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct AgentHooksContent {
+    /// Run before a tool call. A hook that fails (non-zero exit, timeout, or error) blocks the
+    /// call, and its output is given to the agent as the reason.
+    pub pre_tool_use: Option<Vec<AgentHookContent>>,
+    /// Run after a tool call. A failing hook's output is added to the tool's result.
+    pub post_tool_use: Option<Vec<AgentHookContent>>,
+    /// Run when a prompt is sent. A failing hook blocks the prompt; a passing hook's output is
+    /// added to the prompt.
+    pub user_prompt_submit: Option<Vec<AgentHookContent>>,
+    /// Run when the agent finishes a turn. A failing hook's output is sent back to the agent,
+    /// once per turn.
+    pub stop: Option<Vec<AgentHookContent>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct AgentHookContent {
+    /// A regex matched against the tool name. Tool hooks without one run for every tool.
+    pub matcher: Option<String>,
+    /// The shell command to run.
+    pub command: String,
+    /// How long the command may run before it counts as failed.
+    ///
+    /// Default: 60
+    pub timeout_seconds: Option<u64>,
 }
 
 impl AgentSettingsContent {

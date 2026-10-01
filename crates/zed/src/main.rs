@@ -937,10 +937,26 @@ fn main() {
                     }
                 }
             }),
-            Some(request) => {
-                handle_open_request(request, app_state.clone(), cx);
+            // Opening something at launch adds to the last session rather than replacing it, so
+            // the session's unsaved buffers are restored instead of being garbage collected.
+            Some(OpenRequest {
+                kind: Some(OpenRequestKind::CliConnection(connection)),
+                ..
+            }) => {
+                cx.spawn({
+                    let app_state = app_state.clone();
+                    async move |cx| handle_cli_connection(connection, app_state, true, cx).await
+                })
+                .detach();
                 Task::ready(())
             }
+            Some(request) => cx.spawn({
+                let app_state = app_state.clone();
+                async move |cx| {
+                    restore_last_session(&app_state, cx).await;
+                    cx.update(|cx| handle_open_request(request, app_state, cx));
+                }
+            }),
             None => cx.spawn({
                 let app_state = app_state.clone();
                 async move |cx| {
@@ -1007,8 +1023,10 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
     if let Some(kind) = request.kind {
         match kind {
             OpenRequestKind::CliConnection(connection) => {
-                cx.spawn(async move |cx| handle_cli_connection(connection, app_state, cx).await)
-                    .detach();
+                cx.spawn(async move |cx| {
+                    handle_cli_connection(connection, app_state, false, cx).await
+                })
+                .detach();
             }
             OpenRequestKind::FocusApp => {
                 cx.spawn(async move |cx| {
@@ -1419,65 +1437,74 @@ async fn installation_id(db: KeyValueStore) -> Result<IdType> {
     Ok(IdType::New(installation_id))
 }
 
+/// Reopens the last session's workspaces, as `restore_on_startup` selects them, logging each one
+/// that fails. Returns how many failed, or `None` when there is nothing to restore.
+pub(crate) async fn restore_last_session(
+    app_state: &Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Option<usize> {
+    let multi_workspaces = restorable_workspaces(cx, app_state).await?;
+    let mut error_count = 0;
+    for multi_workspace in multi_workspaces {
+        let result = match &multi_workspace.active_workspace.location {
+            SerializedWorkspaceLocation::Local => {
+                restore_multiworkspace(multi_workspace, app_state.clone(), cx)
+                    .await
+                    .map(|_| ())
+            }
+            SerializedWorkspaceLocation::Remote(connection_options) => {
+                let mut connection_options = connection_options.clone();
+                if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
+                    cx.update(|cx| {
+                        RemoteSettings::get_global(cx)
+                            .fill_connection_options_from_settings(options)
+                    });
+                }
+
+                let paths = multi_workspace
+                    .active_workspace
+                    .paths
+                    .paths()
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                let state = multi_workspace.state.clone();
+                async {
+                    let window = open_remote_project(
+                        connection_options,
+                        paths,
+                        app_state.clone(),
+                        workspace::OpenOptions::default(),
+                        cx,
+                    )
+                    .await?;
+                    workspace::apply_restored_multiworkspace_state(
+                        window,
+                        &state,
+                        app_state.fs.clone(),
+                        cx,
+                    )
+                    .await;
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await
+            }
+        };
+
+        if let Err(error) = result {
+            log::error!("Failed to restore workspace: {error:#}");
+            error_count += 1;
+        }
+    }
+    Some(error_count)
+}
+
 pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let kvp = cx.update(|cx| KeyValueStore::global(cx));
-    if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
-        let mut error_count = 0;
-        for multi_workspace in multi_workspaces {
-            let result = match &multi_workspace.active_workspace.location {
-                SerializedWorkspaceLocation::Local => {
-                    restore_multiworkspace(multi_workspace, app_state.clone(), cx)
-                        .await
-                        .map(|_| ())
-                }
-                SerializedWorkspaceLocation::Remote(connection_options) => {
-                    let mut connection_options = connection_options.clone();
-                    if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
-                        cx.update(|cx| {
-                            RemoteSettings::get_global(cx)
-                                .fill_connection_options_from_settings(options)
-                        });
-                    }
-
-                    let paths = multi_workspace
-                        .active_workspace
-                        .paths
-                        .paths()
-                        .iter()
-                        .map(PathBuf::from)
-                        .collect::<Vec<_>>();
-                    let state = multi_workspace.state.clone();
-                    async {
-                        let window = open_remote_project(
-                            connection_options,
-                            paths,
-                            app_state.clone(),
-                            workspace::OpenOptions::default(),
-                            cx,
-                        )
-                        .await?;
-                        workspace::apply_restored_multiworkspace_state(
-                            window,
-                            &state,
-                            app_state.fs.clone(),
-                            cx,
-                        )
-                        .await;
-                        Ok::<(), anyhow::Error>(())
-                    }
-                    .await
-                }
-            };
-
-            if let Err(error) = result {
-                log::error!("Failed to restore workspace: {error:#}");
-                error_count += 1;
-            }
-        }
-
+    if let Some(error_count) = restore_last_session(&app_state, cx).await {
         if error_count > 0 {
             let message = if error_count == 1 {
                 "Failed to restore 1 workspace. Check logs for details.".to_string()

@@ -121,6 +121,8 @@
       "alt-g b": "git::Blame",
       "alt-g m": "git::OpenModifiedFiles",
       "alt-g r": "git::ReviewDiff",
+      "alt-g c": "editor::AddReviewComment",
+      "alt-g enter": "editor::SendReviewToAgent",
       "menu": "editor::OpenContextMenu",
       "shift-f10": "editor::OpenContextMenu",
       "ctrl-alt-shift-e": "editor::ToggleEditPrediction",

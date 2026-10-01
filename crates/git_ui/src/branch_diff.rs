@@ -2,7 +2,7 @@ use crate::{
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
     project_diff::{
-        self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
+        self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewBranch, ReviewDiff,
         render_send_review_to_agent_button,
     },
 };
@@ -74,6 +74,7 @@ impl BranchDiff {
             Self::deploy_branch_diff(workspace, window, cx)
         });
         workspace.register_action(Self::compare_with_branch);
+        workspace.register_action(Self::review_branch);
         workspace::register_serializable_item::<Self>(cx);
     }
 
@@ -131,6 +132,43 @@ impl BranchDiff {
                 })?;
 
                 anyhow::Ok(())
+            })
+            .detach_and_notify_err(workspace_weak, window, cx);
+    }
+
+    fn review_branch(
+        workspace: &mut Workspace,
+        _: &ReviewBranch,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let workspace_weak = workspace.weak_handle();
+        let Some(repository) = workspace.project().read(cx).active_repository(cx) else {
+            Task::ready(Err::<(), _>(anyhow!("No active repository"))).detach_and_notify_err(
+                workspace_weak,
+                window,
+                cx,
+            );
+            return;
+        };
+        let default_branch = repository.update(cx, |repository, _| repository.default_branch(true));
+        window
+            .spawn(cx, {
+                let workspace = workspace_weak.clone();
+                async move |cx| {
+                    let base_ref = default_branch
+                        .await??
+                        .context("No default branch to review the current branch against")?;
+                    workspace.update_in(cx, |workspace, window, cx| {
+                        request_branch_review(
+                            repository,
+                            base_ref,
+                            workspace.weak_handle(),
+                            window,
+                            cx,
+                        );
+                    })
+                }
             })
             .detach_and_notify_err(workspace_weak, window, cx);
     }
@@ -395,46 +433,53 @@ impl BranchDiff {
         let Some(repo) = self.repo(cx) else {
             return;
         };
-
-        let diff_receiver = repo.update(cx, |repo, cx| {
-            repo.diff(
-                DiffType::MergeBase {
-                    base_ref: base_ref.clone(),
-                },
-                cx,
-            )
-        });
-
-        let workspace = self.workspace.clone();
-        window
-            .spawn(cx, {
-                let workspace = workspace.clone();
-                async move |cx| {
-                    let diff_text = diff_receiver.await??;
-
-                    if let Some(workspace) = workspace.upgrade() {
-                        workspace.update_in(cx, |_workspace, window, cx| {
-                            window.dispatch_action(
-                                ReviewBranchDiff {
-                                    diff_text: diff_text.into(),
-                                    base_ref,
-                                }
-                                .boxed_clone(),
-                                cx,
-                            );
-                        })?;
-                    }
-
-                    anyhow::Ok(())
-                }
-            })
-            .detach_and_notify_err(workspace, window, cx);
+        request_branch_review(repo, base_ref, self.workspace.clone(), window, cx);
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn editor(&self, cx: &App) -> Entity<SplittableEditor> {
         self.diff.read(cx).editor().clone()
     }
+}
+
+/// Diffs the repository against its merge base with `base_ref` and asks the agent to review it.
+fn request_branch_review(
+    repository: Entity<Repository>,
+    base_ref: SharedString,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let diff_receiver = repository.update(cx, |repository, cx| {
+        repository.diff(
+            DiffType::MergeBase {
+                base_ref: base_ref.clone(),
+            },
+            cx,
+        )
+    });
+    window
+        .spawn(cx, {
+            let workspace = workspace.clone();
+            async move |cx| {
+                let diff_text = diff_receiver.await??;
+                anyhow::ensure!(
+                    !diff_text.trim().is_empty(),
+                    "No changes against {base_ref} to review"
+                );
+                workspace.update_in(cx, |_, window, cx| {
+                    window.dispatch_action(
+                        ReviewBranchDiff {
+                            diff_text: diff_text.into(),
+                            base_ref,
+                        }
+                        .boxed_clone(),
+                        cx,
+                    );
+                })
+            }
+        })
+        .detach_and_notify_err(workspace, window, cx);
 }
 
 impl EventEmitter<EditorEvent> for BranchDiff {}
@@ -1193,6 +1238,49 @@ mod tests {
                 )
             ])
         );
+    }
+
+    #[gpui::test]
+    async fn test_branch_review_without_changes_reports_error(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": "A" }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        let review_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        cx.update(|_, cx| {
+            let review_requests = review_requests.clone();
+            cx.on_action(move |_: &ReviewBranchDiff, _| {
+                review_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        });
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .expect("project should have a repository");
+
+        cx.update(|window, cx| {
+            request_branch_review(repository, "main".into(), workspace.downgrade(), window, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            review_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an empty diff must not be sent to the agent"
+        );
+        workspace.read_with(cx, |workspace, _| {
+            assert_eq!(
+                workspace.notification_ids().len(),
+                1,
+                "the user should be told there is nothing to review"
+            );
+        });
     }
 
     #[gpui::test]

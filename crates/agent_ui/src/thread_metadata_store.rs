@@ -1331,10 +1331,8 @@ impl ThreadMetadataStore {
             .unwrap_or(worktree_paths.is_empty());
 
         let was_draft = existing_thread.map_or(true, |t| t.is_draft());
-        if was_draft && !is_draft {
-            // Draft has been promoted: drop its persisted prompt since the
-            // promoted thread now owns its prompt state via the native
-            // agent's thread database.
+        if was_draft && !crate::draft_prompt_store::store_owns_draft(thread_ref) {
+            // Draft has been promoted to an agent that saves its own prompt state.
             crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         }
 

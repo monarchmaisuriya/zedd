@@ -15878,3 +15878,140 @@ fn sidebar_painted_background_at(position: Point<Pixels>, cx: &mut VisualTestCon
         u32::from(Rgba::from(color))
     })
 }
+
+/// Lays row `ix` out as an uncached view, so nothing fixes its height.
+fn natural_row_height(
+    sidebar: &Entity<Sidebar>,
+    ix: usize,
+    cx: &mut gpui::VisualTestContext,
+) -> Pixels {
+    let measured = std::rc::Rc::new(std::cell::Cell::new(None));
+    let row = cx.update(|_, cx| cx.new(|cx| SidebarRow::new(sidebar.clone(), ix, cx)));
+    cx.draw(
+        gpui::point(px(0.), px(0.)),
+        gpui::size(px(400.), px(2000.)),
+        |_, _| {
+            let measured = measured.clone();
+            gpui::div()
+                .w(px(400.))
+                .child(row)
+                .on_children_prepainted(move |bounds, _, _| {
+                    measured.set(bounds.first().map(|bounds| bounds.size.height));
+                })
+        },
+    );
+    measured.get().expect("the row should lay out")
+}
+
+async fn sidebar_with_rows(
+    cx: &mut TestAppContext,
+) -> (
+    Entity<Sidebar>,
+    Entity<MultiWorkspace>,
+    &mut gpui::VisualTestContext,
+) {
+    let (fs, project_a) = init_multi_project_test(&["/project-a", "/project-b"], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    add_test_project("/project-b", &fs, &multi_workspace, cx).await;
+    save_n_test_threads(3, &project_a, cx).await;
+    save_thread_metadata_with_main_paths(
+        "project-b-thread",
+        "Project B Thread",
+        PathList::new(&[PathBuf::from("/project-b")]),
+        PathList::new(&[PathBuf::from("/project-b")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 2, 0, 0, 0).unwrap(),
+        cx,
+    );
+    save_draft_metadata_with_main_paths(
+        None,
+        PathList::new(&[PathBuf::from("/project-b")]),
+        PathList::new(&[PathBuf::from("/project-b")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 3, 0, 0, 0).unwrap(),
+        cx,
+    );
+    cx.run_until_parked();
+    (sidebar, multi_workspace, cx)
+}
+
+#[gpui::test]
+async fn test_declared_row_heights_match_rendered_rows(cx: &mut TestAppContext) {
+    let (sidebar, _multi_workspace, cx) = sidebar_with_rows(cx).await;
+    let row_count = sidebar.read_with(cx, |sidebar, _| sidebar.contents.entries.len());
+    let mut heights = Vec::new();
+    for ix in 0..row_count {
+        let declared =
+            sidebar.update_in(cx, |sidebar, window, cx| sidebar.row_height(ix, window, cx));
+        let natural = natural_row_height(&sidebar, ix, cx);
+        assert_eq!(
+            declared, natural,
+            "row {ix} is laid out at its declared height without being rendered"
+        );
+        heights.push(declared);
+    }
+    let distinct = heights
+        .iter()
+        .map(|height| f32::from(*height).to_bits())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct >= 3,
+        "the rows should cover first and later headers and threads with and without a second \
+         line, got {heights:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_animating_row_renders_without_its_neighbors(cx: &mut TestAppContext) {
+    let (sidebar, _multi_workspace, cx) = sidebar_with_rows(cx).await;
+    let (running_ix, idle_ix) = sidebar.read_with(cx, |sidebar, _| {
+        let mut threads = sidebar
+            .contents
+            .entries
+            .iter()
+            .enumerate()
+            .filter(
+                |(_, entry)| matches!(entry, ListEntry::Thread(thread) if thread.draft.is_none()),
+            )
+            .map(|(ix, _)| ix);
+        (threads.next().unwrap(), threads.next().unwrap())
+    });
+    sidebar.update(cx, |sidebar, cx| {
+        if let ListEntry::Thread(thread) = &mut sidebar.contents.entries[running_ix] {
+            Arc::make_mut(thread).status = AgentThreadStatus::Running;
+        }
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let render_counts = |cx: &mut gpui::VisualTestContext| {
+        sidebar.read_with(cx, |sidebar, cx| {
+            (
+                sidebar.row_views[running_ix].read(cx).render_count,
+                sidebar.row_views[idle_ix].read(cx).render_count,
+            )
+        })
+    };
+    let (running_before, idle_before) = render_counts(cx);
+    for _ in 0..3 {
+        cx.update(|window, cx| {
+            assert!(
+                window.simulate_next_frame(cx) > 0,
+                "the spinner asks for frames"
+            );
+            window.draw(cx).clear(cx);
+        });
+    }
+    let (running_after, idle_after) = render_counts(cx);
+
+    assert_eq!(
+        running_after,
+        running_before + 3,
+        "the spinner's row redraws each frame"
+    );
+    assert_eq!(
+        idle_after, idle_before,
+        "the other rows reuse their last frame"
+    );
+}

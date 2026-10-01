@@ -627,6 +627,29 @@ pub mod agent {
         pub base_ref: SharedString,
     }
 
+    /// A review comment on a range of code, as sent to the agent.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
+    pub struct ReviewCommentContent {
+        /// The file's absolute path, or its project path when it has no local path.
+        pub file_path: String,
+        /// Zero-based first row of the commented code.
+        pub start_row: u32,
+        /// Zero-based last row of the commented code.
+        pub end_row: u32,
+        /// The commented code.
+        pub code: String,
+        /// The reviewer's comment.
+        pub comment: String,
+    }
+
+    /// Sends review comments on code changes to the agent.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct SendReviewComments {
+        pub comments: Vec<ReviewCommentContent>,
+    }
+
     /// A single merge conflict region extracted from a file.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
     pub struct ConflictContent {

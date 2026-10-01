@@ -927,6 +927,8 @@ actions!(
         ToggleReviewCommentsExpanded,
         /// Sends all stored review comments to the Agent panel.
         SendReviewToAgent,
+        /// Opens a review comment box for the selected lines of a diff.
+        AddReviewComment,
         /// Toggles the selection menu.
         ToggleSelectionMenu,
         /// Toggles soft wrap mode.

@@ -105,6 +105,9 @@ impl AgentDiffPane {
             diff_display_editor.update_editors(cx, |editor, _cx| {
                 editor.register_addon(AgentDiffAddon);
             });
+            diff_display_editor.rhs_editor().update(cx, |editor, cx| {
+                editor.set_show_diff_review_button(true, cx);
+            });
             diff_display_editor
         });
 
@@ -304,6 +307,27 @@ impl AgentDiffPane {
                 cx,
             );
         });
+    }
+
+    /// Review comments made in this diff go to the thread whose changes it shows.
+    fn send_review_comments(
+        &mut self,
+        action: &zed_actions::agent::SendReviewComments,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread = self.thread.clone();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                crate::agent_panel::send_review_comments(
+                    workspace,
+                    &action.comments,
+                    Some(&thread),
+                    window,
+                    cx,
+                );
+            })
+            .log_err();
     }
 
     fn keep_all(&mut self, _: &KeepAll, _window: &mut Window, cx: &mut Context<Self>) {
@@ -701,6 +725,7 @@ impl Render for AgentDiffPane {
             .on_action(cx.listener(Self::reject))
             .on_action(cx.listener(Self::reject_all))
             .on_action(cx.listener(Self::keep_all))
+            .on_action(cx.listener(Self::send_review_comments))
             // Only paint the background for the empty state. When the diff editor
             // is shown it already paints `editor_background`; painting it again
             // here double-composites into a darker patch on transparent windows.

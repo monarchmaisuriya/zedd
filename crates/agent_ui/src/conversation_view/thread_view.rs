@@ -39,6 +39,7 @@ use gpui::TaskExt;
 use gpui::{AbsoluteLength, DefiniteLength, Length, Pixels, StyleRefinement};
 
 use super::tool_run_summary::{self, ToolSummaryItem, ToolVerb};
+use super::verify_gate::{self, VerifyGate, VerifyOutcome};
 use heapless::Vec as ArrayVec;
 use language_model::{
     FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
@@ -577,6 +578,8 @@ struct ToolOutputPreview {
 
 /// Lines of a long terminal command shown while it is collapsed.
 const COLLAPSED_COMMAND_LINES: usize = 2;
+/// The most output the verification command's terminal keeps.
+const VERIFY_OUTPUT_BYTE_LIMIT: u64 = 256 * 1024;
 
 /// How much of the main text color secondary transcript text keeps over the panel background.
 const SECONDARY_TEXT_OPACITY: f32 = 0.7;
@@ -687,6 +690,7 @@ pub struct ThreadView {
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
+    verify_gate: VerifyGate,
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp_v1::ToolCallId>,
     pub is_loading_contents: bool,
@@ -1104,6 +1108,7 @@ impl ThreadView {
             should_be_following: false,
             editing_message: None,
             message_queue: MessageQueue::default(),
+            verify_gate: VerifyGate::new(project.upgrade().as_ref(), cx),
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
             is_loading_contents: false,
@@ -1578,6 +1583,7 @@ impl ThreadView {
     }
 
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.verify_gate.user_sent_message();
         let thread = &self.thread;
 
         if self.is_loading_contents {
@@ -2210,6 +2216,25 @@ impl ThreadView {
         .detach_and_log_err(cx);
     }
 
+    /// Sends `content` now when the thread is idle, otherwise queues it for after the current turn.
+    pub fn send_or_queue_content(
+        &mut self,
+        content: Vec<acp_v1::ContentBlock>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread.read(cx).status() == acp_thread::ThreadStatus::Idle {
+            self.send_content(
+                Task::ready(Ok(Some((content, Vec::new())))),
+                false,
+                window,
+                cx,
+            );
+        } else {
+            self.add_to_queue(content, Vec::new(), window, cx);
+        }
+    }
+
     pub fn add_to_queue(
         &mut self,
         content: Vec<acp_v1::ContentBlock>,
@@ -2365,6 +2390,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.verify_gate.user_sent_message();
         self.sync_queue_flag_to_native_thread(cx);
 
         cx.emit(AcpThreadViewEvent::Interacted);
@@ -4610,6 +4636,7 @@ impl ThreadView {
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
+                                    .children(self.render_verify_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -5849,6 +5876,156 @@ impl ThreadView {
                     editor.insert_skill_crease(&skill, window, cx);
                 });
             })
+    }
+
+    /// Switches checking this thread's turns with the project's verification command.
+    fn render_verify_toggle(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let project = self.project.upgrade()?;
+        let command = verify_gate::configured_command(&project, cx)?;
+        let runnable = verify_gate::verify_command(&project, cx).is_some();
+        let enabled = self.verify_gate.enabled && runnable;
+        let tooltip_label = if !runnable {
+            format!("Trust this project to verify turns with `{command}`")
+        } else if enabled {
+            format!("Verifying turns with `{command}`")
+        } else {
+            format!("Verify turns with `{command}`")
+        };
+        Some(
+            IconButton::new("verify-turns", IconName::Check)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .toggle_state(enabled)
+                .selected_icon_color(Some(Color::Success))
+                .disabled(!runnable)
+                .tooltip(Tooltip::text(tooltip_label))
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.verify_gate.enabled = !this.verify_gate.enabled;
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// Runs the project's verification command after a turn that used tools, shown in the thread
+    /// as a tool call, and asks the agent once to fix a failure.
+    pub(crate) fn verify_turn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+        if !self.verify_gate.enabled
+            || self.verify_gate.running.is_some()
+            || thread.status() != ThreadStatus::Idle
+            || !thread.used_tools_since_last_user_message()
+            || !self.message_queue.is_empty()
+        {
+            return;
+        }
+        let Some(verify) = self
+            .project
+            .upgrade()
+            .and_then(|project| verify_gate::verify_command(&project, cx))
+        else {
+            return;
+        };
+
+        let thread = self.thread.clone();
+        let tool_call_id = acp_v1::ToolCallId::new(format!("verify-{}", uuid::Uuid::new_v4()));
+        let terminal = thread.update(cx, |thread, cx| {
+            thread.create_terminal(
+                verify.command.clone(),
+                Vec::new(),
+                Vec::new(),
+                Some(verify.cwd.clone()),
+                Some(VERIFY_OUTPUT_BYTE_LIMIT),
+                None,
+                cx,
+            )
+        });
+        let command = verify.command;
+        let timeout = verify.timeout;
+        self.verify_gate.running = Some(cx.spawn_in(window, async move |this, cx| {
+            let outcome = async {
+                let terminal = terminal.await?;
+                let terminal_id = terminal.read_with(cx, |terminal, _| terminal.id().clone());
+                thread
+                    .update(cx, |thread, cx| {
+                        thread.upsert_tool_call(
+                            acp_v1::ToolCall::new(
+                                tool_call_id.clone(),
+                                format!("Verify: `{command}`"),
+                            )
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::InProgress)
+                            .content(vec![
+                                acp_v1::ToolCallContent::Terminal(acp_v1::Terminal::new(
+                                    terminal_id,
+                                )),
+                            ]),
+                            cx,
+                        )
+                    })
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+
+                let exit = terminal.read_with(cx, |terminal, _| terminal.wait_for_exit())?;
+                let timer = cx.background_executor().timer(timeout);
+                let summary = match futures::future::select(exit, timer).await {
+                    futures::future::Either::Left((status, _)) => match status.exit_code {
+                        Some(0) => None,
+                        Some(code) => Some(format!("failed with exit code {code}")),
+                        None => Some("was stopped by a signal".to_string()),
+                    },
+                    futures::future::Either::Right(_) => {
+                        terminal.update(cx, |terminal, cx| terminal.kill(cx));
+                        Some(format!("timed out after {} s", timeout.as_secs()))
+                    }
+                };
+                let output =
+                    terminal.read_with(cx, |terminal, cx| terminal.current_output(cx).output);
+                let status = if summary.is_some() {
+                    acp_v1::ToolCallStatus::Failed
+                } else {
+                    acp_v1::ToolCallStatus::Completed
+                };
+                thread.update(cx, |thread, cx| {
+                    thread.update_tool_call(
+                        acp_v1::ToolCallUpdate::new(
+                            tool_call_id,
+                            acp_v1::ToolCallUpdateFields::new().status(status),
+                        ),
+                        cx,
+                    )
+                })?;
+                anyhow::Ok(match summary {
+                    None => VerifyOutcome::Passed,
+                    Some(summary) => VerifyOutcome::Failed { summary, output },
+                })
+            }
+            .await;
+
+            this.update_in(cx, |this, window, cx| {
+                this.verify_gate.running = None;
+                match outcome {
+                    Ok(outcome) => {
+                        if let Some(prompt) = this.verify_gate.fix_prompt(&command, &outcome) {
+                            this.send_content(
+                                Task::ready(Ok(Some((
+                                    vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
+                                        prompt,
+                                    ))],
+                                    Vec::new(),
+                                )))),
+                                false,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("agent verification `{command}` could not run: {error:#}")
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn render_follow_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -9333,6 +9510,10 @@ impl ThreadView {
             None
         };
 
+        let plan_file_link = tool_call
+            .authorization()
+            .and(tool_call.plan_file_path())
+            .map(|path| self.render_plan_file_link(entry_ix, path, cx));
         let permission_buttons = if let Some(authorization) = tool_call.authorization() {
             let options = &authorization.options;
             Some(self.render_permission_buttons(
@@ -9566,7 +9747,45 @@ impl ThreadView {
                     this.child(body)
                 }
             })
+            .children(plan_file_link)
             .children(permission_buttons)
+    }
+
+    /// Links the plan document a plan-mode exit asks approval for.
+    fn render_plan_file_link(
+        &self,
+        entry_ix: usize,
+        path: PathBuf,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        h_flex().px_2().pt_1().child(
+            Button::new(("plan-file-link", entry_ix), format!("Plan: {file_name}"))
+                .label_size(LabelSize::Small)
+                .end_icon(
+                    Icon::new(IconName::ArrowUpRight)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .tooltip(Tooltip::text(path.to_string_lossy().into_owned()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.workspace
+                        .update(cx, |workspace, cx| {
+                            workspace
+                                .open_abs_path(
+                                    path.clone(),
+                                    workspace::OpenOptions::default(),
+                                    window,
+                                    cx,
+                                )
+                                .detach_and_log_err(cx);
+                        })
+                        .log_err();
+                })),
+        )
     }
 
     /// A small "Learn more" link to the sandboxing docs, deep-linked to
