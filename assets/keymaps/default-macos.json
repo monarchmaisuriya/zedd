@@ -314,6 +314,7 @@
       "ctrl-alt-pageup": "agent::ScrollOutputToPreviousMessage",
       "ctrl-alt-pagedown": "agent::ScrollOutputToNextMessage",
       "cmd-f": "agent::ToggleSearch",
+      "ctrl-o": "agent::CycleTranscriptView",
       "cmd-g": "agent::SelectNextThreadMatch",
       "cmd-shift-g": "agent::SelectPreviousThreadMatch",
       "alt-cmd-c": "search::ToggleCaseSensitive",

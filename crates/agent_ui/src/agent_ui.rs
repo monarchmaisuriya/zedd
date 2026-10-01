@@ -303,6 +303,8 @@ actions!(
         ToggleThinkingEffortMenu,
         /// Toggles fast mode for models that support it.
         ToggleFastMode,
+        /// Cycles the transcript view: normal, thinking, verbose.
+        CycleTranscriptView,
         /// Scroll the output by one page up.
         ScrollOutputPageUp,
         /// Scroll the output by one page down.
@@ -1018,6 +1020,7 @@ mod tests {
                 position: settings::SidebarDockPosition::Left,
             },
             thinking_display: Default::default(),
+            transcript_view: Default::default(),
         };
 
         cx.update(|cx| {

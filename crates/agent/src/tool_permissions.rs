@@ -617,6 +617,7 @@ mod tests {
                 position: settings::SidebarDockPosition::Left,
             },
             thinking_display: Default::default(),
+            transcript_view: Default::default(),
         }
     }
 

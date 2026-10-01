@@ -9100,6 +9100,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Transcript View",
+                description: "How much of the agent's work the transcript shows. 'Normal' folds each run of tool calls into a one-line summary and hides thinking. 'Thinking' also shows thinking. 'Verbose' shows every tool call in full.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.transcript_view"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .transcript_view
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .transcript_view = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Cancel Generation On Terminal Stop",
                 description: "Whether clicking the stop button on a running terminal tool should also cancel the agent's generation. Note that this only applies to the stop button, not to ctrl+c inside the terminal.",
                 field: Box::new(SettingField {

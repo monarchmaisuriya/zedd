@@ -37,13 +37,15 @@ use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
 use gpui::{AbsoluteLength, DefiniteLength, Length, Pixels, StyleRefinement};
+
+use super::tool_run_summary::{self, ToolSummaryItem, ToolVerb};
 use heapless::Vec as ArrayVec;
 use language_model::{
     FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
 };
 use notifications::status_toast::StatusToast;
-use settings::{update_settings_file, update_settings_file_with_completion};
+use settings::{TranscriptView, update_settings_file, update_settings_file_with_completion};
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
     SplitButtonStyle, Tab, ToggleState,
@@ -575,6 +577,20 @@ struct ToolOutputPreview {
 
 /// Lines of a long terminal command shown while it is collapsed.
 const COLLAPSED_COMMAND_LINES: usize = 2;
+
+fn transcript_view_label(transcript_view: TranscriptView) -> &'static str {
+    match transcript_view {
+        TranscriptView::Normal => "Normal",
+        TranscriptView::Thinking => "Thinking",
+        TranscriptView::Verbose => "Verbose",
+    }
+}
+
+fn save_transcript_view(fs: Arc<dyn Fs>, transcript_view: TranscriptView, cx: &mut App) {
+    update_settings_file(fs, cx, move |settings, _| {
+        settings.agent.get_or_insert_default().transcript_view = Some(transcript_view);
+    });
+}
 
 /// Space a markdown code block's style adds above and below its text lines.
 fn code_block_vertical_insets(code_block: &StyleRefinement, rem_size: Pixels) -> (Pixels, Pixels) {
@@ -1322,15 +1338,20 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         match &event.view_event {
+            // Folding views open tool calls only when the user asks.
             ViewEvent::NewDiff(tool_call_id) => {
-                if AgentSettings::get_global(cx).expand_edit_card {
+                if self.entry_view_state.read(cx).transcript_view() == TranscriptView::Verbose
+                    && AgentSettings::get_global(cx).expand_edit_card
+                {
                     self.entry_view_state.update(cx, |state, _cx| {
                         state.expand_tool_call(tool_call_id.clone());
                     });
                 }
             }
             ViewEvent::NewTerminal(tool_call_id) => {
-                if AgentSettings::get_global(cx).expand_terminal_card {
+                if self.entry_view_state.read(cx).transcript_view() == TranscriptView::Verbose
+                    && AgentSettings::get_global(cx).expand_terminal_card
+                {
                     self.entry_view_state.update(cx, |state, _cx| {
                         state.expand_tool_call(tool_call_id.clone());
                     });
@@ -4575,6 +4596,7 @@ impl ThreadView {
                                             .children(self.mode_selector.clone())
                                             .children(self.model_selector.clone()),
                                     })
+                                    .child(self.render_transcript_view_selector(cx))
                                     .child(self.render_send_button(cx)),
                             ),
                     ),
@@ -6493,6 +6515,7 @@ impl ThreadView {
             }) => {
                 let mut is_blank = true;
                 let is_last = entry_ix + 1 == total_entries;
+                let hide_thinking = !self.entry_view_state.read(cx).shows_thinking();
 
                 let message_body = v_flex()
                     .w_full()
@@ -6512,6 +6535,9 @@ impl ThreadView {
                                 })
                             }
                             AssistantMessageChunk::Thought { block, .. } => {
+                                if hide_thinking {
+                                    return None;
+                                }
                                 let this_is_blank = !block.visible_content(cx);
                                 is_blank = is_blank && this_is_blank;
                                 (!this_is_blank).then(|| {
@@ -6548,52 +6574,19 @@ impl ThreadView {
                 }
             }
             AgentThreadEntry::ToolCall(tool_call) => {
-                // A canceled tool call that produced visible output is still worth
-                // showing, but one that was canceled before producing anything just
-                // renders as a useless "Canceled" card — hide those entirely.
-                if matches!(tool_call.status(), ToolCallStatus::Canceled) {
-                    let has_visible_content =
-                        tool_call.content().iter().any(|content| match content {
-                            ToolCallContent::ContentBlock { block, .. } => {
-                                block.visible_content(cx)
-                            }
-                            ToolCallContent::Diff(_)
-                            | ToolCallContent::LegacyDiff { .. }
-                            | ToolCallContent::Terminal { .. } => true,
-                            ToolCallContent::DiffPatch { render, .. } => {
-                                !render.files.is_empty()
-                                    || render.fallback.as_ref().is_some_and(|markdown| {
-                                        !markdown.read(cx).source().is_empty()
-                                    })
-                            }
-                            ToolCallContent::Other { markdown, .. } => {
-                                !markdown.read(cx).source().is_empty()
-                            }
-                        });
-                    if !has_visible_content {
-                        return Empty.into_any();
-                    }
+                if EntryViewState::is_hidden_canceled_tool_call(tool_call, cx) {
+                    return Empty.into_any();
                 }
 
-                let tool_call = self.render_any_tool_call(
-                    self.thread.read(cx).session_id(),
+                let run = self.entry_view_state.read(cx).tool_run_range(
+                    self.thread.read(cx).entries(),
                     entry_ix,
-                    tool_call,
-                    &self.focus_handle(cx),
-                    ToolCallLayout::Standalone,
-                    window,
                     cx,
                 );
-
-                if let Some(handle) = self
-                    .entry_view_state
-                    .read(cx)
-                    .entry(entry_ix)
-                    .and_then(|entry| entry.focus_handle(cx))
-                {
-                    tool_call.track_focus(&handle).into_any()
+                if let Some(run) = run {
+                    self.render_tool_run_entry(entry_ix, run, tool_call, window, cx)
                 } else {
-                    tool_call.into_any()
+                    self.render_standalone_tool_call(entry_ix, tool_call, window, cx)
                 }
             }
             AgentThreadEntry::Elicitation(elicitation_id) => {
@@ -7682,6 +7675,7 @@ impl ThreadView {
 
         v_flex()
             .id(("thinking-block", chunk_ix))
+            .debug_selector(|| "thinking-block".into())
             .gap_1()
             .child(
                 h_flex()
@@ -8442,6 +8436,385 @@ impl ThreadView {
             .map_or(false, |(pending_session_id, pending_tool_call_id, _)| {
                 self.thread.read(cx).session_id() == &pending_session_id
                     && tool_call_id == &pending_tool_call_id
+            })
+    }
+
+    fn tool_run_members<'a>(
+        &self,
+        run: std::ops::Range<usize>,
+        cx: &'a App,
+    ) -> Vec<(usize, &'a ToolCall)> {
+        let entries = self.thread.read(cx).entries();
+        run.filter_map(|ix| match entries.get(ix)? {
+            AgentThreadEntry::ToolCall(tool_call)
+                if !EntryViewState::is_hidden_canceled_tool_call(tool_call, cx) =>
+            {
+                Some((ix, tool_call))
+            }
+            _ => None,
+        })
+        .collect()
+    }
+
+    fn tool_summary_item(tool_call: &ToolCall, cx: &App) -> ToolSummaryItem {
+        let has_diff = tool_call.content().iter().any(|content| {
+            matches!(
+                content,
+                ToolCallContent::Diff(_)
+                    | ToolCallContent::LegacyDiff { .. }
+                    | ToolCallContent::DiffPatch { .. }
+            )
+        });
+        let verb = match tool_call.kind() {
+            acp_v2::ToolKind::Read => ToolVerb::Read,
+            acp_v2::ToolKind::Edit => ToolVerb::Edit,
+            acp_v2::ToolKind::Delete => ToolVerb::Delete,
+            acp_v2::ToolKind::Move => ToolVerb::Move,
+            acp_v2::ToolKind::Search => ToolVerb::Search,
+            acp_v2::ToolKind::Execute => ToolVerb::Execute,
+            acp_v2::ToolKind::Think => ToolVerb::Think,
+            acp_v2::ToolKind::Fetch => ToolVerb::Fetch,
+            acp_v2::ToolKind::SwitchMode => ToolVerb::SwitchMode,
+            _ if has_diff => ToolVerb::Edit,
+            _ => ToolVerb::Other,
+        };
+        let file_name = || {
+            tool_call.locations.first().and_then(|location| {
+                location
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+        };
+        let title =
+            || tool_run_summary::short_subject(&tool_call.label.read(cx).source().replace('`', ""));
+        let subject = match verb {
+            ToolVerb::Read | ToolVerb::Edit | ToolVerb::Delete | ToolVerb::Move => file_name(),
+            _ => title(),
+        };
+        ToolSummaryItem {
+            verb,
+            subject,
+            running: matches!(
+                tool_call.status(),
+                ToolCallStatus::Pending | ToolCallStatus::InProgress
+            ),
+        }
+    }
+
+    fn tool_call_failed(tool_call: &ToolCall) -> bool {
+        matches!(
+            tool_call.status(),
+            ToolCallStatus::Failed | ToolCallStatus::Rejected
+        )
+    }
+
+    /// Lines added and removed across a tool call's diffs; `None` when it has none.
+    fn tool_call_line_counts(tool_call: &ToolCall, cx: &App) -> Option<(usize, usize)> {
+        let mut counts = None;
+        for content in tool_call.content() {
+            let multibuffers = match content {
+                ToolCallContent::Diff(diff) | ToolCallContent::LegacyDiff { diff, .. } => {
+                    vec![diff.read(cx).multibuffer().clone()]
+                }
+                ToolCallContent::DiffPatch { render, .. } => render
+                    .files
+                    .iter()
+                    .flat_map(|file| file.hunks.iter().map(|hunk| hunk.buffer.clone()))
+                    .collect(),
+                _ => continue,
+            };
+            for multibuffer in multibuffers {
+                let multibuffer = multibuffer.read(cx);
+                for buffer in multibuffer.all_buffers_iter() {
+                    if let Some(diff) = multibuffer.diff_for(buffer.read(cx).remote_id()) {
+                        let (added, removed) = diff.read(cx).changed_row_counts();
+                        let (total_added, total_removed) = counts.get_or_insert((0, 0));
+                        *total_added += added as usize;
+                        *total_removed += removed as usize;
+                    }
+                }
+            }
+        }
+        counts
+    }
+
+    /// One entry of a folded run: the run's summary line on its first tool call, and, while
+    /// the run is open, this tool call's own line (with its full rendering when opened).
+    fn render_tool_run_entry(
+        &self,
+        entry_ix: usize,
+        run: std::ops::Range<usize>,
+        tool_call: &ToolCall,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let members = self.tool_run_members(run.clone(), cx);
+        let Some(&(first_ix, first)) = members.first() else {
+            return Empty.into_any();
+        };
+        let first_id = first.id.clone();
+        let is_open = self.entry_view_state.read(cx).is_tool_run_open(&first_id);
+        let is_first = first_ix == entry_ix;
+        if !is_open && !is_first {
+            return Empty.into_any();
+        }
+
+        let summary_line = is_first.then(|| {
+            let items = members
+                .iter()
+                .map(|(_, tool_call)| Self::tool_summary_item(tool_call, cx))
+                .collect::<Vec<_>>();
+            let failed = members
+                .iter()
+                .filter(|(_, tool_call)| Self::tool_call_failed(tool_call))
+                .count();
+            let line_counts = match members.as_slice() {
+                [(_, only)] => Self::tool_call_line_counts(only, cx),
+                _ => None,
+            };
+            let member_ids = members
+                .iter()
+                .map(|(_, tool_call)| tool_call.id.clone())
+                .collect::<Vec<_>>();
+            h_flex()
+                .id(("tool-run-summary", entry_ix))
+                .debug_selector(|| "tool-run-summary".into())
+                .w_full()
+                .px_5()
+                .py_0p5()
+                .gap_1()
+                .cursor_pointer()
+                .child(
+                    Label::new(tool_run_summary::run_summary(&items))
+                        .size(LabelSize::Custom(self.tool_name_font_size()))
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .when_some(line_counts, |this, (added, removed)| {
+                    this.child(DiffStat::new(
+                        ("tool-run-diff-stat", entry_ix),
+                        added,
+                        removed,
+                    ))
+                })
+                .when(failed > 0, |this| {
+                    this.child(
+                        Label::new(format!("· {failed} failed"))
+                            .size(LabelSize::Custom(self.tool_name_font_size()))
+                            .color(Color::Error),
+                    )
+                })
+                .child(
+                    Icon::new(if is_open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.entry_view_state.update(cx, |state, _| {
+                        state.toggle_tool_run(&first_id, &member_ids);
+                    });
+                    this.list_state.remeasure_items(run.clone());
+                    this.refresh_thread_search(window, cx);
+                    cx.notify();
+                }))
+        });
+
+        v_flex()
+            .w_full()
+            .children(summary_line)
+            .when(is_open, |this| {
+                this.child(self.render_tool_run_member(entry_ix, tool_call, window, cx))
+            })
+            .into_any()
+    }
+
+    fn render_tool_run_member(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        let item = Self::tool_summary_item(tool_call, cx);
+        let is_expanded = self
+            .entry_view_state
+            .read(cx)
+            .is_tool_call_expanded(&tool_call.id);
+        let line_counts = Self::tool_call_line_counts(tool_call, cx);
+        let color = if Self::tool_call_failed(tool_call) {
+            Color::Error
+        } else {
+            Color::Muted
+        };
+        let tool_call_id = tool_call.id.clone();
+
+        v_flex()
+            .w_full()
+            .child(
+                h_flex()
+                    .id(("tool-run-member", entry_ix))
+                    .debug_selector(move || format!("tool-run-member-{entry_ix}"))
+                    .ml_5()
+                    .mr_5()
+                    .pl_3()
+                    .py_0p5()
+                    .gap_1()
+                    .border_l_1()
+                    .border_color(self.tool_card_border_color(cx))
+                    .cursor_pointer()
+                    .child(
+                        Label::new(tool_run_summary::member_line(&item))
+                            .size(LabelSize::Custom(self.tool_name_font_size()))
+                            .color(color)
+                            .truncate(),
+                    )
+                    .when_some(line_counts, |this, (added, removed)| {
+                        this.child(DiffStat::new(
+                            ("tool-run-member-diff-stat", entry_ix),
+                            added,
+                            removed,
+                        ))
+                    })
+                    .child(
+                        Icon::new(if is_expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.entry_view_state.update(cx, |state, _| {
+                            state.toggle_tool_call_expansion(&tool_call_id);
+                        });
+                        this.list_state.remeasure_items(entry_ix..entry_ix + 1);
+                        this.refresh_thread_search(window, cx);
+                        cx.notify();
+                    })),
+            )
+            .when(is_expanded, |this| {
+                this.child(self.render_standalone_tool_call(entry_ix, tool_call, window, cx))
+            })
+    }
+
+    fn render_standalone_tool_call(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let tool_call = self.render_any_tool_call(
+            self.thread.read(cx).session_id(),
+            entry_ix,
+            tool_call,
+            &self.focus_handle(cx),
+            ToolCallLayout::Standalone,
+            window,
+            cx,
+        );
+
+        if let Some(handle) = self
+            .entry_view_state
+            .read(cx)
+            .entry(entry_ix)
+            .and_then(|entry| entry.focus_handle(cx))
+        {
+            tool_call.track_focus(&handle).into_any()
+        } else {
+            tool_call.into_any()
+        }
+    }
+
+    /// Re-applies the transcript view after the setting changes.
+    pub(crate) fn apply_transcript_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let transcript_view = AgentSettings::get_global(cx).transcript_view;
+        let changed = self
+            .entry_view_state
+            .update(cx, |state, _| state.set_transcript_view(transcript_view));
+        if !changed {
+            return;
+        }
+        self.list_state.remeasure();
+        self.refresh_thread_search(window, cx);
+        cx.notify();
+    }
+
+    fn cycle_transcript_view(
+        &mut self,
+        _: &CycleTranscriptView,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = match self.entry_view_state.read(cx).transcript_view() {
+            TranscriptView::Normal => TranscriptView::Thinking,
+            TranscriptView::Thinking => TranscriptView::Verbose,
+            TranscriptView::Verbose => TranscriptView::Normal,
+        };
+        if let Some(fs) = self.settings_fs(cx) {
+            save_transcript_view(fs, next, cx);
+        }
+    }
+
+    fn settings_fs(&self, cx: &App) -> Option<Arc<dyn Fs>> {
+        Some(self.project.upgrade()?.read(cx).fs().clone())
+    }
+
+    fn render_transcript_view_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.entry_view_state.read(cx).transcript_view();
+        let focus_handle = self.message_editor.focus_handle(cx);
+        let fs = self.settings_fs(cx);
+        PopoverMenu::new("transcript-view-selector")
+            .trigger_with_tooltip(
+                Button::new("transcript-view-trigger", transcript_view_label(current))
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .end_icon(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                move |_window, cx| {
+                    Tooltip::for_action_in(
+                        "Transcript View",
+                        &CycleTranscriptView,
+                        &focus_handle,
+                        cx,
+                    )
+                },
+            )
+            .anchor(gpui::Anchor::BottomRight)
+            .menu(move |window, cx| {
+                let fs = fs.clone()?;
+                Some(ContextMenu::build(
+                    window,
+                    cx,
+                    move |mut menu, _window, _cx| {
+                        for transcript_view in [
+                            TranscriptView::Normal,
+                            TranscriptView::Thinking,
+                            TranscriptView::Verbose,
+                        ] {
+                            let fs = fs.clone();
+                            menu = menu.toggleable_entry(
+                                transcript_view_label(transcript_view),
+                                transcript_view == current,
+                                IconPosition::Start,
+                                None,
+                                move |_window, cx| {
+                                    save_transcript_view(fs.clone(), transcript_view, cx)
+                                },
+                            );
+                        }
+                        menu
+                    },
+                ))
             })
     }
 
@@ -9724,7 +10097,7 @@ impl ThreadView {
         allow_disabled: bool,
         cx: &Context<Self>,
     ) -> Div {
-        match options {
+        let buttons = match options {
             PermissionOptions::Flat(options) => self.render_permission_buttons_flat(
                 session_id,
                 is_first,
@@ -9761,7 +10134,8 @@ impl ThreadView {
                 allow_disabled,
                 cx,
             ),
-        }
+        };
+        buttons.debug_selector(move || format!("permission-buttons-{entry_ix}"))
     }
 
     fn render_permission_buttons_with_dropdown(
@@ -12954,6 +13328,7 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_to_previous_message))
             .on_action(cx.listener(Self::scroll_output_to_next_message))
             .on_action(cx.listener(Self::toggle_search))
+            .on_action(cx.listener(Self::cycle_transcript_view))
             .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
                 this.toggle_fast_mode(window, cx);
             }))

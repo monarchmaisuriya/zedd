@@ -97,6 +97,32 @@ pub enum ThinkingBlockDisplay {
     AlwaysCollapsed,
 }
 
+/// How much of the agent's work the agent panel transcript shows.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptView {
+    /// Each run of tool calls is folded into a one-line summary; thinking is hidden.
+    #[default]
+    Normal,
+    /// Like normal, and thinking is shown.
+    Thinking,
+    /// Every tool call is shown in full, with thinking.
+    Verbose,
+}
+
 /// Threshold at which agent auto-compaction runs. See
 /// [`AutoCompactSettingsContent::threshold`] for the accepted formats.
 ///
@@ -380,6 +406,12 @@ pub struct AgentSettingsContent {
     ///
     /// Default: automatic
     pub thinking_display: Option<ThinkingBlockDisplay>,
+    /// How much of the agent's work the transcript shows: "normal" folds each run of tool
+    /// calls into a one-line summary and hides thinking, "thinking" also shows thinking,
+    /// "verbose" shows every tool call in full.
+    ///
+    /// Default: normal
+    pub transcript_view: Option<TranscriptView>,
     /// Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     /// Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     ///

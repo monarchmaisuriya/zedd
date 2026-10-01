@@ -1,6 +1,8 @@
 use std::{ops::Range, sync::Arc};
 
-use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall};
+use acp_thread::{
+    AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall, ToolCallContent, ToolCallStatus,
+};
 use agent::ThreadStore;
 use agent_client_protocol::schema::v1 as acp_v1;
 use agent_settings::AgentSettings;
@@ -17,13 +19,24 @@ use language::language_settings::SoftWrap;
 use multi_buffer::MultiBuffer;
 use project::{AgentId, Project, project_settings::DiagnosticSeverity};
 use rope::Point;
-use settings::{Settings as _, ThinkingBlockDisplay};
+use settings::{Settings as _, ThinkingBlockDisplay, TranscriptView};
 use terminal_view::TerminalView;
 use theme_settings::ThemeSettings;
 use ui::{Context, TextSize};
 use workspace::Workspace;
 
 use crate::message_editor::{MessageEditor, MessageEditorEvent, SharedSessionCapabilities};
+
+/// How an entry takes part in folding runs of tool calls into one summary line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptRole {
+    /// A tool call that folds into its run's summary line.
+    Foldable,
+    /// Draws nothing in the current view, so it doesn't split a run.
+    Transparent,
+    /// Always drawn; ends a run.
+    Boundary,
+}
 
 /// Maps an entry index through the removal of `removed` (a contiguous range of
 /// entries), returning `None` if the index referred to a removed entry.
@@ -55,6 +68,10 @@ pub struct EntryViewState {
     overflowing_commands: HashSet<acp_v1::ToolCallId>,
     /// Terminal tool calls whose collapsed command the user chose to show in full.
     expanded_commands: HashSet<acp_v1::ToolCallId>,
+    /// Folded runs of tool calls the user opened, keyed by the run's first tool call.
+    open_tool_runs: HashSet<acp_v1::ToolCallId>,
+    /// Decides what the transcript draws, and so what thread search can match.
+    transcript_view: TranscriptView,
 }
 
 impl EntryViewState {
@@ -80,6 +97,8 @@ impl EntryViewState {
             fully_shown_tool_outputs: HashSet::default(),
             overflowing_commands: HashSet::default(),
             expanded_commands: HashSet::default(),
+            open_tool_runs: HashSet::default(),
+            transcript_view: TranscriptView::default(),
         }
     }
 
@@ -140,6 +159,143 @@ impl EntryViewState {
         if !self.expanded_commands.remove(tool_call_id) {
             self.expanded_commands.insert(tool_call_id.clone());
         }
+    }
+
+    pub(crate) fn is_tool_run_open(&self, first_tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.open_tool_runs.contains(first_tool_call_id)
+    }
+
+    /// Closing a run also closes its tool calls, so no hidden tool counts as shown.
+    pub(crate) fn toggle_tool_run(
+        &mut self,
+        first_tool_call_id: &acp_v1::ToolCallId,
+        member_ids: &[acp_v1::ToolCallId],
+    ) {
+        if self.open_tool_runs.remove(first_tool_call_id) {
+            for id in member_ids {
+                self.expanded_tool_calls.remove(id);
+            }
+        } else {
+            self.open_tool_runs.insert(first_tool_call_id.clone());
+        }
+    }
+
+    pub(crate) fn transcript_view(&self) -> TranscriptView {
+        self.transcript_view
+    }
+
+    /// Returns whether the view changed. A folding view starts with every run and tool
+    /// call closed, so nothing hidden counts as shown.
+    pub(crate) fn set_transcript_view(&mut self, transcript_view: TranscriptView) -> bool {
+        if transcript_view == self.transcript_view {
+            return false;
+        }
+        self.transcript_view = transcript_view;
+        if transcript_view != TranscriptView::Verbose {
+            self.open_tool_runs.clear();
+            self.expanded_tool_calls.clear();
+        }
+        true
+    }
+
+    pub(crate) fn shows_thinking(&self) -> bool {
+        self.transcript_view != TranscriptView::Normal
+    }
+
+    /// A tool call canceled before producing anything renders as a useless "Canceled" card,
+    /// so it is hidden; one that produced visible output is still worth showing.
+    pub(crate) fn is_hidden_canceled_tool_call(tool_call: &ToolCall, cx: &App) -> bool {
+        matches!(tool_call.status(), ToolCallStatus::Canceled)
+            && !tool_call.content().iter().any(|content| match content {
+                ToolCallContent::ContentBlock { block, .. } => block.visible_content(cx),
+                ToolCallContent::Diff(_)
+                | ToolCallContent::LegacyDiff { .. }
+                | ToolCallContent::Terminal { .. } => true,
+                ToolCallContent::DiffPatch { render, .. } => {
+                    !render.files.is_empty()
+                        || render
+                            .fallback
+                            .as_ref()
+                            .is_some_and(|markdown| !markdown.read(cx).source().is_empty())
+                }
+                ToolCallContent::Other { markdown, .. } => !markdown.read(cx).source().is_empty(),
+            })
+    }
+
+    fn transcript_role(&self, entry: &AgentThreadEntry, cx: &App) -> TranscriptRole {
+        match entry {
+            AgentThreadEntry::ToolCall(tool_call) => {
+                if Self::is_hidden_canceled_tool_call(tool_call, cx) {
+                    TranscriptRole::Transparent
+                } else if tool_call.is_subagent() || tool_call.authorization().is_some() {
+                    // A subagent keeps its live card, and a permission prompt is never folded away.
+                    TranscriptRole::Boundary
+                } else {
+                    TranscriptRole::Foldable
+                }
+            }
+            AgentThreadEntry::AssistantMessage(message) => {
+                let draws_something = message.chunks.iter().any(|chunk| match chunk {
+                    AssistantMessageChunk::Message { block, .. } => block.visible_content(cx),
+                    AssistantMessageChunk::Thought { block, .. } => {
+                        self.shows_thinking() && block.visible_content(cx)
+                    }
+                });
+                if draws_something {
+                    TranscriptRole::Boundary
+                } else {
+                    TranscriptRole::Transparent
+                }
+            }
+            AgentThreadEntry::UserMessage(_)
+            | AgentThreadEntry::Elicitation(_)
+            | AgentThreadEntry::ContextCompaction(_) => TranscriptRole::Boundary,
+        }
+    }
+
+    /// The entries folded together with `entry_ix` into one summary line, from the run's
+    /// first tool call to its last. `None` when the entry is not folded in this view.
+    pub(crate) fn tool_run_range(
+        &self,
+        entries: &[AgentThreadEntry],
+        entry_ix: usize,
+        cx: &App,
+    ) -> Option<Range<usize>> {
+        if self.transcript_view == TranscriptView::Verbose {
+            return None;
+        }
+        if self.transcript_role(entries.get(entry_ix)?, cx) != TranscriptRole::Foldable {
+            return None;
+        }
+        let mut start = entry_ix;
+        for ix in (0..entry_ix).rev() {
+            match entries.get(ix).map(|entry| self.transcript_role(entry, cx)) {
+                Some(TranscriptRole::Foldable) => start = ix,
+                Some(TranscriptRole::Transparent) => {}
+                Some(TranscriptRole::Boundary) | None => break,
+            }
+        }
+        let mut end = entry_ix + 1;
+        for (ix, entry) in entries.iter().enumerate().skip(entry_ix + 1) {
+            match self.transcript_role(entry, cx) {
+                TranscriptRole::Foldable => end = ix + 1,
+                TranscriptRole::Transparent => {}
+                TranscriptRole::Boundary => break,
+            }
+        }
+        Some(start..end)
+    }
+
+    /// A folded tool call shows its own label only once the user opens it.
+    pub(crate) fn is_tool_call_label_shown(
+        &self,
+        entries: &[AgentThreadEntry],
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        cx: &App,
+    ) -> bool {
+        self.tool_run_range(entries, entry_ix, cx).is_none()
+            || self.is_tool_call_expanded(&tool_call.id)
     }
 
     pub(crate) fn is_compaction_expanded(&self, entry_ix: usize) -> bool {
