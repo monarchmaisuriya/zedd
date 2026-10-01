@@ -768,6 +768,16 @@ fn create_worktree_in_workspace(
 /// The line between project groups.
 const GROUP_SEPARATOR_WIDTH: Pixels = px(1.);
 
+/// The sidebar is painted like a code file.
+fn sidebar_background(colors: &theme::ThemeColors) -> gpui::Hsla {
+    colors.editor_background
+}
+
+/// The sidebar background, opaque enough to hide rows scrolling under a sticky header.
+fn sidebar_overlay_background(colors: &theme::ThemeColors) -> gpui::Hsla {
+    colors.overlay_background(sidebar_background(colors))
+}
+
 /// One sidebar row as its own view. A row that animates, like a running thread's spinner,
 /// redraws alone while the other rows reuse their last frame.
 struct SidebarRow {
@@ -2427,9 +2437,9 @@ impl Sidebar {
 
         let color = cx.theme().colors();
         let sidebar_base_bg = if is_sticky {
-            color.surface_overlay_background()
+            sidebar_overlay_background(color)
         } else {
-            color.surface_background
+            sidebar_background(color)
         };
 
         // The fade gradient renders as a visible patch on transparent windows,
@@ -3369,7 +3379,7 @@ impl Sidebar {
             .unwrap_or(px(0.));
 
         let color = cx.theme().colors();
-        let background = color.surface_overlay_background();
+        let background = sidebar_overlay_background(color);
 
         let element = v_flex()
             .absolute()
@@ -6359,7 +6369,7 @@ impl Sidebar {
         let id = SharedString::from(format!("thread-entry-{}", ix));
 
         let color = cx.theme().colors();
-        let sidebar_bg = color.surface_background;
+        let sidebar_bg = sidebar_background(color);
         let button_hover_bg = color.element_background;
         let button_active_bg = color.element_active;
 
@@ -6702,7 +6712,7 @@ impl Sidebar {
         let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
         let is_hovered = self.hovered_thread_index == Some(ix);
         let color = cx.theme().colors();
-        let sidebar_bg = color.surface_background;
+        let sidebar_bg = sidebar_background(color);
         let button_hover_bg = color.element_background;
         let button_active_bg = color.element_active;
         let metadata = terminal.metadata.clone();
@@ -8055,7 +8065,7 @@ impl Render for Sidebar {
         let sticky_header = self.render_sticky_header(window, cx);
 
         let color = cx.theme().colors();
-        let bg = color.surface_background;
+        let bg = sidebar_background(color);
 
         let no_open_projects = !self.contents.has_open_projects;
         let no_search_results = self.contents.entries.is_empty();

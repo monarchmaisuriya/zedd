@@ -707,6 +707,38 @@ fn visible_entries_as_strings(
 }
 
 #[gpui::test]
+async fn test_sidebar_is_painted_like_a_code_file(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    cx.update(|cx| AgentRegistryStore::init_test_global(cx, Vec::new()));
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    save_n_test_threads(1, &project, cx).await;
+    cx.update(|window, cx| {
+        let mut theme = cx.theme().as_ref().clone();
+        theme.styles.colors.editor_background = Hsla::from(gpui::rgb(0x1f1f1f));
+        theme.styles.colors.surface_background = Hsla::from(gpui::rgb(0x303030));
+        theme::GlobalTheme::update_theme(cx, Arc::new(theme));
+        window.refresh();
+    });
+    cx.run_until_parked();
+
+    let last_row = sidebar.read_with(cx, |sidebar, _| {
+        let last = sidebar.contents.entries.len() - 1;
+        sidebar
+            .list_state
+            .bounds_for_item(last)
+            .expect("rendered last row")
+    });
+    let below_rows = gpui::point(last_row.center().x, last_row.bottom() + px(40.));
+    assert_eq!(
+        sidebar_painted_background_at(below_rows, cx),
+        0x1f1f1fff,
+        "the thread list should be painted with the editor background"
+    );
+}
+
+#[gpui::test]
 async fn test_sidebar_action_hover_contrasts_with_row(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     cx.update(|cx| AgentRegistryStore::init_test_global(cx, Vec::new()));
@@ -715,8 +747,8 @@ async fn test_sidebar_action_hover_contrasts_with_row(cx: &mut TestAppContext) {
     let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
     save_n_test_threads(1, &project, cx).await;
 
-    for (query, surface_alpha) in [("my-project", 1.0), ("", 1.0), ("", 0.0), ("", 0.2)] {
-        set_sidebar_test_surface_alpha(surface_alpha, cx);
+    for (query, background_alpha) in [("my-project", 1.0), ("", 1.0), ("", 0.0), ("", 0.2)] {
+        set_sidebar_test_background_alpha(background_alpha, cx);
         type_in_search(&sidebar, query, cx);
         let row_bounds = sidebar.read_with(cx, |sidebar, _| {
             sidebar
@@ -779,7 +811,7 @@ async fn test_sidebar_action_hover_contrasts_with_row(cx: &mut TestAppContext) {
                 .map(|value| px(value.as_f32() / window.scale_factor()))
         });
         for surface_alpha in [1.0, 0.0, 0.2] {
-            set_sidebar_test_surface_alpha(surface_alpha, cx);
+            set_sidebar_test_background_alpha(surface_alpha, cx);
             assert_sidebar_action_hover(selector, row_bounds, cx);
         }
     }
@@ -15823,11 +15855,11 @@ async fn test_find_or_create_workspace_returns_the_created_remote_workspace(
     );
 }
 
-fn set_sidebar_test_surface_alpha(alpha: f32, cx: &mut VisualTestContext) {
+fn set_sidebar_test_background_alpha(alpha: f32, cx: &mut VisualTestContext) {
     cx.update(|window, cx| {
         let mut theme = cx.theme().as_ref().clone();
         theme.styles.colors.background = Hsla::from(gpui::rgb(0xdcdcdd));
-        theme.styles.colors.surface_background = Hsla::from(gpui::rgb(0xebebec)).alpha(alpha);
+        theme.styles.colors.editor_background = Hsla::from(gpui::rgb(0xebebec)).alpha(alpha);
         theme.styles.colors.element_background = Hsla::from(gpui::rgb(0xebebec));
         theme.styles.colors.ghost_element_hover = Hsla::from(gpui::rgb(0xdfdfe0));
         theme::GlobalTheme::update_theme(cx, Arc::new(theme));
