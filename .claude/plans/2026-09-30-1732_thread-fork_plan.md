@@ -25,7 +25,7 @@ M wants Claude-Code-style fork in zedd's Agent Panel: branch a thread from a pas
 **Non-goals**
 - Rewind or code restore (M dropped it).
 - Copying or isolating files; the fork shares the project working tree, as in Claude Code.
-- External ACP agents, such as the one M uses at work (pending Decision 1). The capability is designed so they can be added later.
+- External ACP agents (pending Decision 1). The capability is designed so they can be added later.
 - A stored "forked from" link in the sidebar (needs a sidebar schema change; Decision 4).
 
 ## What is true today
@@ -57,7 +57,7 @@ AgentPanel::open_thread(session_id, ...)  -> sidebar row created from the opened
 
 ## Decisions for M (before Part 1)
 
-1. **Which agents?** A: native Zed agent only; B: also external agents via ACP `session/fork` (unstable Draft; whole-thread only; M's work agent does not implement it).
+1. **Which agents?** A: native Zed agent only; B: also external agents via ACP `session/fork` (unstable Draft; whole-thread only).
    RECOMMENDATION: A because it is the only path that supports forking at a message. Completeness: A 8/10, B 8/10 native + 4/10 external.
 2. **Where does "Fork from here" cut?** A: before message N, with N's content in the editor (edit and resend on the new branch); B: after N's reply (the fork continues from that answer).
    RECOMMENDATION: A because it matches how edit-and-resend already cuts (`Thread::truncate`), and B is covered by forking from the next message or by "Fork Thread". Completeness: A 9/10, B 7/10.
@@ -249,7 +249,7 @@ M, 2026-09-30: "in the dropdown I want based on the message like screenshot I sh
 - Current-system accuracy: pass; every claim above cites code or the crate source.
 - Architecture: pass; `ForkPoint` is decided by the view, executed by each connection; external capability lives in `AcpConnection`, like `close`/`resume`.
 - Failure and recovery: pass; external message-level fork fails loudly; agents without load or resume never show fork; ACP errors surface in the thread banner.
-- Verification: pass; each part has tests; the external path cannot be tested end to end without an agent that implements `session/fork` (the research found M's work agent does not), so it is covered by the in-repo fake ACP agent.
+- Verification: pass; each part has tests; the external path cannot be tested end to end without an agent that implements `session/fork` (none was available during the research), so it is covered by the in-repo fake ACP agent.
 - Risk (note): `session/fork` is an unstable ACP method; if the spec changes, only `AcpConnection::fork` changes.
 
 ## Revision 3 (2026-09-30 21:15): per-message fork for Claude Code; OpenCode whole thread

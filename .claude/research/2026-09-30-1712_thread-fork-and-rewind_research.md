@@ -12,12 +12,12 @@ File location note: `zedd/docs/` is Zed's mdbook site (`docs/book.toml`), so thi
 
 - **Bottom line:** zedd has no fork, but the native agent already has every building block: persisted, stable user-message ids; a thread snapshot (`Thread::to_db`); a "save under a new session id, then open" path; and a persisted draft prompt. Option A adds a fork capability next to `truncate` on `AgentConnection`, implements it for the native agent, and adds "Fork from here" to each user message plus a whole-thread "Fork Thread" action.
 - **Where we are:** framing done; code paths read directly; 9 primary sources carried over from the first pass. Next step is the plan (drafted alongside this brief).
-- **Need from M:** pick an option, and say which agent this is for (native Zed agent, or an external ACP agent such as the one M uses at work).
+- **Need from M:** pick an option, and say which agent this is for (native Zed agent, or an external ACP agent).
 
 ### Glossary
 
 - **Native agent:** Zed's built-in agent (`crates/agent`). It runs inside Zed and saves threads in Zed's SQLite database (`threads.db`).
-- **External agent:** a separate program Zed drives over ACP (Agent Client Protocol, JSON-RPC over stdio), for example the agent M uses at work. It owns its own conversation history.
+- **External agent:** a separate program Zed drives over ACP (Agent Client Protocol, JSON-RPC over stdio). It owns its own conversation history.
 - **Session id:** the id of one thread (`acp::SessionId`). A fork gets a new one.
 - **Client user message id:** a UUID Zed gives each user message (`ClientUserMessageId`); it is saved with the thread and is the cut point for a fork.
 - **Capability:** an optional method on `AgentConnection` that returns `Some(...)` only for agents that support a feature (for example `truncate`). The UI shows a button only when the capability is present.
@@ -71,7 +71,7 @@ AgentPanel::open_thread(new SessionId)                exists
 - **Sidebar rows come from opened conversations.** `ThreadMetadataStore` subscribes to conversation views and upserts a row on their events [verified: `crates/agent_ui/src/thread_metadata_store.rs:1195-1232`, `:1335-1355`]. So opening the fork in the panel should create its sidebar row with no extra code [inferred; check by running].
 - **Sidebar rows have no "forked from" field.** `ThreadMetadata` holds thread_id, session_id, agent_id, title, title_override, timestamps, worktree_paths, remote_connection, archived [verified: `thread_metadata_store.rs:1341-1353`]. A visible link back to the original thread would need a schema change.
 - **Subagent sessions would be shared.** A subagent child thread records its parent's session id (`SubagentContext { parent_thread_id, depth }`) [verified: `crates/agent/src/thread.rs:141-147`], and the spawn-agent tool lets the model send follow-ups to an existing child by `session_id` [verified: `crates/agent/src/tools/spawn_agent_tool.rs:27-53`]. A forked thread keeps the tool calls that name the original's children, so the fork's agent could send a follow-up to a child the original thread also uses [inferred].
-- **External agents cannot fork at a message.** The ACP crate in use (2.2.0, `unstable` feature on) defines `session/fork` with `ForkSessionRequest { session_id, cwd, additional_directories, mcp_servers, meta }` and no message id [inferred from the codebase map: schema 1.9.1 `src/v1/agent.rs:1119-1156`]. The spec lists session fork as a Draft RFD [verified, primary: [ACP session fork RFD](https://agentclientprotocol.com/rfds/session-fork)]. Fork-at-message (PR #629) was closed in favour of an open "session cursor" RFD (PR #2114) [verified, primary: [PR #629](https://github.com/agentclientprotocol/agent-client-protocol/pull/629), [PR #2114](https://github.com/agentclientprotocol/agent-client-protocol/pull/2114)]. M's work agent's ACP server advertises list, resume, and close, not fork [verified: an earlier research brief on that agent, kept outside this repo].
+- **External agents cannot fork at a message.** The ACP crate in use (2.2.0, `unstable` feature on) defines `session/fork` with `ForkSessionRequest { session_id, cwd, additional_directories, mcp_servers, meta }` and no message id [inferred from the codebase map: schema 1.9.1 `src/v1/agent.rs:1119-1156`]. The spec lists session fork as a Draft RFD [verified, primary: [ACP session fork RFD](https://agentclientprotocol.com/rfds/session-fork)]. Fork-at-message (PR #629) was closed in favour of an open "session cursor" RFD (PR #2114) [verified, primary: [PR #629](https://github.com/agentclientprotocol/agent-client-protocol/pull/629), [PR #2114](https://github.com/agentclientprotocol/agent-client-protocol/pull/2114)].
 - **Upstream demand.** Zed issue #54954 asks for "Fork conversation", a default title of "<title> (fork)", and a visible link to the source; closed without a maintainer plan [verified, tertiary: [zed#54954](https://github.com/zed-industries/zed/issues/54954)].
 
 ### What must be true
@@ -97,7 +97,7 @@ Open checks:
 | --- | --- | --- | --- |
 | How it works | New `AgentSessionFork` capability on `AgentConnection`. Native implementation: `Thread::to_db`, cut `messages` before message N, keep matching token usage, clear summary, reset sandbox temp dir, set `draft_prompt` to message N, title "<title> (fork)", save under a new `SessionId`, open in the panel. "Fork Thread" (whole thread) uses the same call with no cut. | Everything in A, plus `AcpConnection` implements the capability with `session/fork` when the agent advertises it. Only whole-thread fork is possible. | New thread whose first prompt contains the old conversation as text, like "New From Summary" but verbatim. |
 | Fits our code | Follows the `truncate` capability pattern; reuses `to_db`, `save_thread`, `open_thread`. | Uses an unstable crate feature already enabled in `Cargo.toml`. | Reuses `NewNativeAgentThreadFromSummary` plumbing. |
-| Cost and blast radius | About 5 files in 3 crates; no schema change; additive UI. | Small on top of A, but only agents that implement the Draft method benefit; M's work agent does not. | Small. |
+| Cost and blast radius | About 5 files in 3 crates; no schema change; additive UI. | Small on top of A, but only agents that implement the Draft method benefit. | Small. |
 | When it fails | Subagent children shared between fork and original; forking mid-generation; external-agent threads show no fork button. | Spec changes (Draft RFD); per-message fork impossible. | The agent sees text, not its real tool history; context fills fast. Not a real fork. |
 | Completeness | 8/10 for native threads | 8/10 native, 4/10 external | 3/10 |
 
@@ -122,7 +122,7 @@ Original thread: untouched
 
 RECOMMENDATION: A because every step reuses code that already exists for native threads, it needs no schema change, and the capability slot lets B be added later without touching the UI.
 
-What would change it: if M's work agent (an external agent) is M's main agent, A does nothing visible for it, and B still cannot fork at a message.
+What would change it: if an external agent is M's main agent, A does nothing visible for it, and B still cannot fork at a message.
 
 ### Sources
 
@@ -154,13 +154,13 @@ Method: direct reads of the files above, `grep` for fork, draft_prompt, save, an
 
 ### Decisions needed
 
-1. **Finding 1** — Say whether fork is for the native agent, M's work agent, or both. Recommendation: native (A).
+1. **Finding 1** — Say whether fork is for the native agent, external agents, or both. Recommendation: native (A).
 
 ### Findings
 
 ### 1. MUST-VERIFY — The recommendation does nothing if M's main agent is external
 
-- **Why it matters:** A only adds fork to native threads; threads with M's work agent would show no fork button.
+- **Why it matters:** A only adds fork to native threads; threads with external agents would show no fork button.
 - **Recommendation:** M answers before implementation; if external, the plan adds B and accepts whole-thread fork only.
 - **Need from M:** which agent.
 
@@ -174,7 +174,6 @@ Method: direct reads of the files above, `grep` for fork, draft_prompt, save, an
 #### Evidence
 
 - [verified] `AcpConnection` has no fork, truncate, or client-id capability outside `test_support` (`crates/agent_servers/src/acp.rs:1967`).
-- [verified] An earlier research brief positions M's work agent as an external agent.
 
 ### 2. MUST-VERIFY — Forked threads can send follow-ups to the original thread's subagents
 
