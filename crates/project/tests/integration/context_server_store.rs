@@ -1903,3 +1903,71 @@ impl ContextServerDescriptor for FakeContextServerDescriptor {
         Task::ready(Ok(None))
     }
 }
+
+#[gpui::test]
+async fn test_built_in_server_runs_like_a_configured_server(cx: &mut TestAppContext) {
+    let server_id = ContextServerId("built-in".into());
+    let (_fs, project) = setup_context_server_test(cx, json!({ "code.rs": "" }), vec![]).await;
+
+    let executor = cx.executor();
+    let started_configurations = Rc::new(RefCell::new(Vec::new()));
+    let store = project.read_with(cx, |project, _| project.context_server_store());
+    store.update(cx, |store, _| {
+        let started_configurations = started_configurations.clone();
+        store.set_context_server_factory(Box::new(move |id, configuration| {
+            started_configurations.borrow_mut().push(configuration);
+            Arc::new(ContextServer::new(
+                id.clone(),
+                Arc::new(create_fake_transport(id.0.to_string(), executor.clone())),
+            ))
+        }));
+    });
+    cx.run_until_parked();
+
+    {
+        let _server_events = assert_server_events(
+            &store,
+            vec![
+                (server_id.clone(), ContextServerStatus::Starting),
+                (server_id.clone(), ContextServerStatus::Running),
+            ],
+            cx,
+        );
+        store.update(cx, |store, cx| {
+            store.set_built_in_server(
+                server_id.0.clone(),
+                ContextServerSettings::Http {
+                    enabled: true,
+                    url: "http://127.0.0.1:4000/mcp".to_string(),
+                    headers: [("Authorization".to_string(), "Bearer secret".to_string())]
+                        .into_iter()
+                        .collect(),
+                    timeout: None,
+                    oauth: None,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+    }
+    store.read_with(cx, |store, _| {
+        assert_eq!(store.configured_server_ids(), vec![server_id.clone()]);
+    });
+    match started_configurations.borrow().as_slice() {
+        [configuration] => match configuration.as_ref() {
+            ContextServerConfiguration::Http { url, headers, .. } => {
+                assert_eq!(url.as_str(), "http://127.0.0.1:4000/mcp");
+                assert_eq!(headers["Authorization"], "Bearer secret");
+            }
+            _ => panic!("expected an HTTP server"),
+        },
+        configurations => panic!("expected one start, got {}", configurations.len()),
+    }
+
+    store.update(cx, |store, cx| store.remove_built_in_server("built-in", cx));
+    cx.run_until_parked();
+    store.read_with(cx, |store, _| {
+        assert!(store.configured_server_ids().is_empty());
+        assert!(store.get_server(&server_id).is_none());
+    });
+}

@@ -289,6 +289,9 @@ struct ContextServerSettingsEntry {
 pub struct ContextServerStore {
     state: ContextServerStoreState,
     context_server_settings: HashMap<Arc<str>, ContextServerSettingsEntry>,
+    /// Servers zedd itself hosts, merged into `context_server_settings`.
+    built_in_servers: HashMap<Arc<str>, ContextServerSettings>,
+    maintain_server_loop: bool,
     servers: HashMap<ContextServerId, ContextServerState>,
     server_ids: Vec<ContextServerId>,
     worktree_store: Entity<WorktreeStore>,
@@ -464,7 +467,7 @@ impl ContextServerStore {
             let ai_was_disabled = this.ai_disabled;
             this.ai_disabled = ai_disabled;
 
-            let settings = Self::resolve_all_context_server_settings(&this.worktree_store, cx);
+            let settings = this.resolve_settings_with_built_in_servers(cx);
             let settings_changed = this.context_server_settings != settings;
 
             if settings_changed {
@@ -499,8 +502,7 @@ impl ContextServerStore {
                         | WorktreeStoreEvent::WorktreeRemoved(_, _)
                 ) && !DisableAiSettings::get_global(cx).disable_ai
                 {
-                    this.context_server_settings =
-                        Self::resolve_all_context_server_settings(&this.worktree_store, cx);
+                    this.context_server_settings = this.resolve_settings_with_built_in_servers(cx);
                     this.available_context_servers_changed(cx);
                 }
             }));
@@ -511,6 +513,8 @@ impl ContextServerStore {
             state,
             _subscriptions: subscriptions,
             context_server_settings: Self::resolve_all_context_server_settings(&worktree_store, cx),
+            built_in_servers: HashMap::default(),
+            maintain_server_loop,
             worktree_store,
             project: weak_project,
             registry,
@@ -526,6 +530,55 @@ impl ContextServerStore {
             this.available_context_servers_changed(cx);
         }
         this
+    }
+
+    /// Adds a server that zedd itself hosts, offered to agents like a server from settings. A
+    /// server from settings with the same id takes precedence. Remote projects ignore built-in
+    /// servers: zedd hosts them on this machine, and agents of a remote project run elsewhere.
+    pub fn set_built_in_server(
+        &mut self,
+        id: Arc<str>,
+        settings: ContextServerSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.built_in_servers.insert(id, settings);
+        self.built_in_servers_changed(cx);
+    }
+
+    pub fn remove_built_in_server(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.built_in_servers.remove(id).is_some() {
+            self.built_in_servers_changed(cx);
+        }
+    }
+
+    fn built_in_servers_changed(&mut self, cx: &mut Context<Self>) {
+        let settings = self.resolve_settings_with_built_in_servers(cx);
+        if self.context_server_settings == settings {
+            return;
+        }
+        self.context_server_settings = settings;
+        if self.maintain_server_loop && !self.ai_disabled {
+            self.available_context_servers_changed(cx);
+        }
+        cx.notify();
+    }
+
+    fn resolve_settings_with_built_in_servers(
+        &self,
+        cx: &App,
+    ) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
+        let mut settings = Self::resolve_all_context_server_settings(&self.worktree_store, cx);
+        if !self.is_remote_project() {
+            for (id, built_in) in &self.built_in_servers {
+                settings
+                    .entry(id.clone())
+                    .or_insert_with(|| ContextServerSettingsEntry {
+                        worktree_id: None,
+                        settings: built_in.clone(),
+                    });
+            }
+        }
+        settings
     }
 
     pub fn get_server(&self, id: &ContextServerId) -> Option<Arc<ContextServer>> {

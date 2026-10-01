@@ -650,6 +650,14 @@ pub mod agent {
         pub comments: Vec<ReviewCommentContent>,
     }
 
+    /// Adds a description of an element picked in the browser panel to the agent's message.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct AddBrowserElementToThread {
+        pub description: String,
+    }
+
     /// A single merge conflict region extracted from a file.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
     pub struct ConflictContent {

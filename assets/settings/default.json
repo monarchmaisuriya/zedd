@@ -995,6 +995,21 @@
       "on_drop": true,
     },
   },
+  "browser": {
+    // Whether to show the browser panel button in the status bar.
+    "button": true,
+    // Where to dock the browser panel. Can be 'left' or 'right'.
+    "dock": "right",
+    // Default width of the browser panel.
+    "default_width": 640,
+    // The Chromium-based browser to run, for example
+    // "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".
+    // When null, zedd uses the first of Chrome, Chromium, Edge or Brave in /Applications.
+    "chrome_path": null,
+    // Whether agents in local projects get tools to open pages in the browser panel,
+    // read them, click, type, and take screenshots.
+    "agent_tools": true,
+  },
   "outline_panel": {
     // Whether to show the outline panel button in the status bar
     "button": true,

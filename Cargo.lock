@@ -2416,6 +2416,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "base64 0.22.1",
+ "collections",
+ "context_server",
+ "futures 0.3.34",
+ "gpui",
+ "image",
+ "libc",
+ "log",
+ "parking_lot",
+ "paths",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "smol",
+ "tempfile",
+ "util",
+]
+
+[[package]]
+name = "browser_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "browser",
+ "collections",
+ "context_server",
+ "editor",
+ "fs",
+ "gpui",
+ "menu",
+ "project",
+ "serde_json",
+ "settings",
+ "smol",
+ "tempfile",
+ "theme",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "brush-parser"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3748,7 +3797,6 @@ dependencies = [
  "gpui",
  "http_client",
  "log",
- "net",
  "oauth_callback_server",
  "parking_lot",
  "postage",
@@ -3759,7 +3807,7 @@ dependencies = [
  "settings",
  "sha2",
  "slotmap",
- "tempfile",
+ "tiny_http",
  "url",
  "util",
 ]
@@ -22738,6 +22786,7 @@ dependencies = [
  "auto_update",
  "auto_update_ui",
  "breadcrumbs",
+ "browser_panel",
  "call",
  "call_hierarchy",
  "channel",

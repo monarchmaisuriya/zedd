@@ -3327,6 +3327,16 @@ impl ConversationView {
         }
     }
 
+    pub(crate) fn insert_text(&self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active_thread) = self.active_thread() {
+            active_thread.update(cx, |thread, cx| {
+                thread.active_editor(cx).update(cx, |editor, cx| {
+                    editor.insert_text(text, window, cx);
+                })
+            });
+        }
+    }
+
     fn current_model_name(&self, cx: &App) -> SharedString {
         // For native agent (Zed Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
         // For ACP agents, use the agent name (e.g., "Claude Agent", "Gemini CLI")
