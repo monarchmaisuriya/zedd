@@ -18,7 +18,7 @@ pub struct TerminalSandboxWarning {
 pub struct TerminalToolHeader {
     id: SharedString,
     hover_group: SharedString,
-    working_dir: SharedString,
+    working_dir: Option<SharedString>,
     is_expanded: bool,
     elapsed: Option<Duration>,
     running: bool,
@@ -35,13 +35,13 @@ impl TerminalToolHeader {
     pub fn new(
         id: impl Into<SharedString>,
         hover_group: impl Into<SharedString>,
-        working_dir: impl Into<SharedString>,
+        working_dir: Option<SharedString>,
         is_expanded: bool,
     ) -> Self {
         Self {
             id: id.into(),
             hover_group: hover_group.into(),
-            working_dir: working_dir.into(),
+            working_dir,
             is_expanded,
             elapsed: None,
             running: false,
@@ -143,13 +143,17 @@ impl RenderOnce for TerminalToolHeader {
             .justify_between()
             .rounded_t_md()
             .child(
-                div().w_full().min_w_0().overflow_hidden().child(
-                    Label::new(working_dir)
-                        .buffer_font(cx)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate_start(),
-                ),
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .children(working_dir.map(|working_dir| {
+                        Label::new(working_dir)
+                            .buffer_font(cx)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate_start()
+                    })),
             )
             .child(
                 Disclosure::new(child_id("disclosure"), is_expanded)
@@ -265,7 +269,7 @@ mod tests {
         impl Render for Header {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 div().w(px(400.)).child(
-                    TerminalToolHeader::new("test", "test", "/project", true)
+                    TerminalToolHeader::new("test", "test", Some("/project".into()), true)
                         .running(true)
                         .when(self.stoppable, |header| {
                             header.on_stop(cx.listener(|this, _, _, _| this.stops += 1))
@@ -308,7 +312,7 @@ impl Component for TerminalToolHeader {
     }
 
     fn preview(_window: &mut Window, cx: &mut App) -> AnyElement {
-        let working_dir = "/Users/you/projects/zed";
+        let working_dir = Some(SharedString::from("/Users/you/projects/zed"));
 
         let card = |_id: &'static str, header: TerminalToolHeader| {
             v_flex()
@@ -345,7 +349,7 @@ impl Component for TerminalToolHeader {
                         TerminalToolHeader::new(
                             "running",
                             "preview-terminal-header-group-running",
-                            working_dir,
+                            working_dir.clone(),
                             false,
                         )
                         .running(true),
@@ -358,7 +362,7 @@ impl Component for TerminalToolHeader {
                         TerminalToolHeader::new(
                             "elapsed",
                             "preview-terminal-header-group-elapsed",
-                            working_dir,
+                            working_dir.clone(),
                             false,
                         )
                         .elapsed(Duration::from_secs(83)),
@@ -371,7 +375,7 @@ impl Component for TerminalToolHeader {
                         TerminalToolHeader::new(
                             "truncated",
                             "preview-terminal-header-group-truncated",
-                            working_dir,
+                            working_dir.clone(),
                             true,
                         )
                         .truncated(
@@ -387,7 +391,7 @@ impl Component for TerminalToolHeader {
                         TerminalToolHeader::new(
                             "failed",
                             "preview-terminal-header-group-failed",
-                            working_dir,
+                            working_dir.clone(),
                             false,
                         )
                         .failed(Some(101)),
@@ -400,7 +404,7 @@ impl Component for TerminalToolHeader {
                         TerminalToolHeader::new(
                             "sandbox",
                             "preview-terminal-header-group-sandbox",
-                            working_dir,
+                            working_dir.clone(),
                             false,
                         )
                         .sandbox_warning(sandbox_warning()),
@@ -415,7 +419,7 @@ impl Component for TerminalToolHeader {
                             TerminalToolHeader::new(
                                 "long-path",
                                 "preview-terminal-header-group-long-path",
-                                "/Users/you/Documents/GitHub/worktrees/some-monorepo/working-tree-three/packages/deeply/nested/service/backend/src",
+                                Some("/Users/you/Documents/GitHub/worktrees/some-monorepo/working-tree-three/packages/deeply/nested/service/backend/src".into()),
                                 false,
                             ),
                         ))

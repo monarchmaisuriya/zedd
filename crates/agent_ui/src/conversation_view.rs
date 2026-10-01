@@ -8735,6 +8735,129 @@ pub(crate) mod tests {
         (conversation_view, cx)
     }
 
+    /// Opens a thread with one finished terminal tool call that ran `command`, with
+    /// `tool_output_preview_lines` set to 3 and the card open.
+    async fn setup_terminal_command<'a>(
+        command: &str,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<AcpThread>,
+        acp_v1::ToolCallId,
+        &'a mut VisualTestContext,
+    ) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        add_to_workspace_with_size(conversation_view.clone(), true, cx);
+        cx.update(|_, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    tool_output_preview_lines: 3,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let terminal_id = acp_v1::TerminalId::new("command-terminal");
+        let tool_call_id = acp_v1::ToolCallId::new("command-tool");
+        let terminal = cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                Default::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                acp_thread::TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: command.into(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal,
+                },
+                cx,
+            );
+            thread
+                .handle_session_update(
+                    acp_v1::SessionUpdate::ToolCall(
+                        acp_v1::ToolCall::new(tool_call_id.clone(), command)
+                            .kind(acp_v1::ToolKind::Execute)
+                            .status(acp_v1::ToolCallStatus::Completed)
+                            .content(vec![acp_v1::ToolCallContent::Terminal(
+                                acp_v1::Terminal::new(terminal_id),
+                            )]),
+                    ),
+                    cx,
+                )
+                .expect("terminal tool call");
+        });
+        thread_view.update(cx, |view, cx| {
+            view.entry_view_state.update(cx, |state, _| {
+                state.expand_tool_call(tool_call_id.clone());
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (thread, tool_call_id, cx)
+    }
+
+    #[gpui::test]
+    async fn test_long_terminal_command_is_collapsed_until_expanded(cx: &mut TestAppContext) {
+        let (_thread, _tool_call_id, cx) = setup_terminal_command(&numbered_lines(6), cx).await;
+        let collapsed = cx
+            .debug_bounds("collapsed-command")
+            .expect("a command taller than two lines is collapsed");
+        cx.simulate_click(collapsed.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("collapsed-command").is_none(),
+            "clicking the collapsed command shows it in full"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_two_line_terminal_command_is_not_collapsed(cx: &mut TestAppContext) {
+        // Fenced, so the code block's own spacing must not count as extra lines.
+        let (_thread, _tool_call_id, cx) =
+            setup_terminal_command("```\ncargo build\ncargo test\n```", cx).await;
+        assert!(cx.debug_bounds("collapsed-command").is_none());
+    }
+
+    #[gpui::test]
+    async fn test_terminal_command_awaiting_permission_is_never_collapsed(cx: &mut TestAppContext) {
+        let (thread, tool_call_id, cx) = setup_terminal_command(&numbered_lines(6), cx).await;
+        assert!(cx.debug_bounds("collapsed-command").is_some());
+        let _authorization = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp_v1::ToolCallUpdate::new(
+                        tool_call_id.clone(),
+                        acp_v1::ToolCallUpdateFields::new(),
+                    ),
+                    PermissionOptions::Flat(vec![acp_v1::PermissionOption::new(
+                        "allow-command",
+                        "Allow",
+                        acp_v1::PermissionOptionKind::AllowOnce,
+                    )]),
+                    acp_thread::AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .expect("authorization request");
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("collapsed-command").is_none(),
+            "a command awaiting permission must be shown in full"
+        );
+    }
+
     fn numbered_lines(count: usize) -> String {
         (1..=count)
             .map(|line| format!("line {line}"))
@@ -8902,6 +9025,10 @@ pub(crate) mod tests {
             )
         };
         assert_eq!(displayed_lines(cx), 3);
+        assert!(
+            cx.debug_bounds("terminal-output-fade").is_some(),
+            "a cut terminal output fades out at the bottom"
+        );
 
         let show_all = cx
             .debug_bounds("tool-output-show-all")
@@ -8909,6 +9036,7 @@ pub(crate) mod tests {
         cx.simulate_click(show_all.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert!(displayed_lines(cx) >= 10, "Show all shows every line");
+        assert!(cx.debug_bounds("terminal-output-fade").is_none());
 
         let show_less = cx
             .debug_bounds("tool-output-show-less")

@@ -36,6 +36,7 @@ use db::kvp::KeyValueStore;
 use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
+use gpui::{AbsoluteLength, DefiniteLength, Length, Pixels, StyleRefinement};
 use heapless::Vec as ArrayVec;
 use language_model::{
     FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
@@ -570,6 +571,32 @@ struct ToolOutputPreview {
     total_lines: usize,
     fully_shown: bool,
     clamped: bool,
+}
+
+/// Lines of a long terminal command shown while it is collapsed.
+const COLLAPSED_COMMAND_LINES: usize = 2;
+
+/// Space a markdown code block's style adds above and below its text lines.
+fn code_block_vertical_insets(code_block: &StyleRefinement, rem_size: Pixels) -> (Pixels, Pixels) {
+    let zero = AbsoluteLength::Pixels(Pixels::ZERO);
+    let margin = |length: Option<Length>| match length {
+        Some(Length::Definite(length)) => length.to_pixels(zero, rem_size),
+        _ => Pixels::ZERO,
+    };
+    let padding = |length: Option<DefiniteLength>| {
+        length.map_or(Pixels::ZERO, |length| length.to_pixels(zero, rem_size))
+    };
+    let border = |width: Option<AbsoluteLength>| {
+        width.map_or(Pixels::ZERO, |width| width.to_pixels(rem_size))
+    };
+    (
+        margin(code_block.margin.top)
+            + padding(code_block.padding.top)
+            + border(code_block.border_widths.top),
+        margin(code_block.margin.bottom)
+            + padding(code_block.padding.bottom)
+            + border(code_block.border_widths.bottom),
+    )
 }
 
 pub struct ThreadView {
@@ -7937,27 +7964,30 @@ impl ThreadView {
         has_running_terminal_call
     }
 
+    /// `collapsible_for` names the terminal tool call whose command is cut to
+    /// `COLLAPSED_COMMAND_LINES` when it is taller, while output previews are on.
     fn render_collapsible_command(
         &self,
         group: SharedString,
         is_preview: bool,
         command: Entity<Markdown>,
+        collapsible_for: Option<&acp_v1::ToolCallId>,
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
         // The label's markdown source is a fenced code block (```\n...\n```);
         // strip the fences so the copy button yields just the command text.
         let command_source = command.read(cx).source();
-        let command_text = command_source
+        let fenced_command = command_source
             .strip_prefix("```\n")
-            .and_then(|s| s.strip_suffix("\n```"))
-            .unwrap_or(&command_source)
-            .to_string();
+            .and_then(|s| s.strip_suffix("\n```"));
+        let command_text = fenced_command.unwrap_or(&command_source).to_string();
 
         let mut style =
             MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
         style.container_style.text.font_size = Some(rems_from_px(12_f32).into());
-        style.container_style.text.line_height = Some(rems_from_px(17_f32).into());
+        let line_height = rems_from_px(17_f32);
+        style.container_style.text.line_height = Some(line_height.into());
         style.height_is_multiple_of_line_height = true;
         // Soft-wrap the command instead of horizontally scrolling it: the card is
         // narrow, and in scroll mode a long command wraps anyway but its wrapped
@@ -7965,6 +7995,13 @@ impl ThreadView {
         // text out as a normal block inside the padded content box, so every
         // line (wrapped or not) is padded consistently.
         style.code_block_overflow_x_scroll = false;
+        let line_height = line_height.to_pixels(window.rem_size());
+        // Only a fenced command renders inside a code block, with its spacing.
+        let (top_inset, bottom_inset) = if fenced_command.is_some() {
+            code_block_vertical_insets(&style.code_block, window.rem_size())
+        } else {
+            (Pixels::ZERO, Pixels::ZERO)
+        };
 
         let header_bg = self.tool_card_header_bg(cx);
         let run_command_label = if is_preview {
@@ -7994,14 +8031,107 @@ impl ThreadView {
             .tooltip_label("Copy Command")
             .visible_on_hover(group.clone());
 
+        let collapsible_for =
+            collapsible_for.filter(|_| AgentSettings::get_global(cx).tool_output_preview_lines > 0);
+        let entry_view_state = self.entry_view_state.read(cx);
+        let overflows = collapsible_for.is_some_and(|id| entry_view_state.command_overflows(id));
+        let clamped = overflows
+            && collapsible_for.is_some_and(|id| !entry_view_state.is_command_expanded(id));
+        let toggle_command_expanded = |tool_call_id: acp_v1::ToolCallId| {
+            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.entry_view_state.update(cx, |state, _| {
+                    state.toggle_command_expanded(&tool_call_id);
+                });
+                cx.notify();
+            })
+        };
+
+        let command_body = div()
+            .relative()
+            .when(clamped, |this| {
+                this.max_h(top_inset + line_height * COLLAPSED_COMMAND_LINES as f32)
+                    .overflow_hidden()
+                    .debug_selector(|| "collapsed-command".into())
+            })
+            .child(markdown_element)
+            .when_some(collapsible_for, |this, tool_call_id| {
+                // The command's height depends on how it soft-wraps, known only after layout.
+                // The clamp above doesn't shrink the child, so this is its full height.
+                let overflow_height =
+                    top_inset + bottom_inset + line_height * (COLLAPSED_COMMAND_LINES as f32 + 0.5);
+                let thread_view = cx.entity().downgrade();
+                let tool_call_id = tool_call_id.clone();
+                this.on_children_prepainted(move |bounds, _window, cx| {
+                    let Some(bounds) = bounds.first() else {
+                        return;
+                    };
+                    let overflows = bounds.size.height > overflow_height;
+                    let thread_view = thread_view.clone();
+                    let tool_call_id = tool_call_id.clone();
+                    // A notify during a draw doesn't schedule another frame, so record the
+                    // measurement once this draw is done.
+                    cx.defer(move |cx| {
+                        thread_view
+                            .update(cx, |this, cx| {
+                                let changed = this.entry_view_state.update(cx, |state, _| {
+                                    state.set_command_overflows(&tool_call_id, overflows)
+                                });
+                                if changed {
+                                    cx.notify();
+                                }
+                            })
+                            .log_err();
+                    });
+                })
+            })
+            .when_some(collapsible_for.filter(|_| clamped), |this, tool_call_id| {
+                this.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "{group}-collapsed-command-fade"
+                        )))
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .cursor_pointer()
+                        .bg(linear_gradient(
+                            0.,
+                            linear_color_stop(header_bg, 0.),
+                            linear_color_stop(header_bg.opacity(0.), 0.5),
+                        ))
+                        .block_mouse_except_scroll()
+                        .on_click(toggle_command_expanded(tool_call_id.clone())),
+                )
+            });
+
+        let expand_button = collapsible_for.filter(|_| overflows).map(|tool_call_id| {
+            let (icon, tooltip) = if clamped {
+                (IconName::ChevronDown, "Show Full Command")
+            } else {
+                (IconName::ChevronUp, "Collapse Command")
+            };
+            IconButton::new(SharedString::from(format!("{group}-expand-command")), icon)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(toggle_command_expanded(tool_call_id.clone()))
+        });
+
         v_flex()
-            .group(group)
+            .group(group.clone())
             .relative()
             .p_1p5()
             .bg(header_bg)
             .when(is_preview, |this| this.pt_1().children(run_command_label))
-            .child(markdown_element)
-            .child(div().absolute().top_1().right_1().child(copy_button))
+            .child(command_body)
+            .child(
+                h_flex()
+                    .absolute()
+                    .top_1()
+                    .right_1()
+                    .children(expand_button.map(|button| button.visible_on_hover(group.clone())))
+                    .child(copy_button),
+            )
     }
 
     fn render_terminal_tool_call(
@@ -8062,13 +8192,14 @@ impl ThreadView {
 
         let working_dir = working_dir
             .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "current directory".to_string());
+            .map(|path| SharedString::from(path.display().to_string()));
 
+        // A command awaiting permission is always shown in full.
         let command_element = self.render_collapsible_command(
             header_group.clone(),
             false,
             tool_call.label.clone(),
+            (!needs_confirmation).then_some(&tool_call.id),
             window,
             cx,
         );
@@ -8159,13 +8290,10 @@ impl ThreadView {
             .overflow_hidden()
             .child(header)
             .when(is_expanded && terminal_view.is_some(), |this| {
-                let preview_toggle = self.render_terminal_preview_toggle(
-                    terminal,
-                    terminal_view.as_ref(),
-                    tool_call,
-                    window,
-                    cx,
-                );
+                let preview = terminal_view.as_ref().and_then(|terminal_view| {
+                    self.terminal_output_preview(terminal_view, tool_call, window, cx)
+                });
+                let terminal_background = cx.theme().colors().terminal_background;
                 this.child(
                     div()
                         .pt_2()
@@ -8188,15 +8316,47 @@ impl ThreadView {
                             };
 
                             div()
+                                .relative()
                                 .on_action(cx.listener(|_this, _: &NewTerminal, window, cx| {
                                     window.dispatch_action(NewThread.boxed_clone(), cx);
                                     cx.stop_propagation();
                                 }))
                                 .child(element)
+                                .when(
+                                    preview.as_ref().is_some_and(|preview| preview.clamped),
+                                    |this| {
+                                        this.child(
+                                            div()
+                                                .absolute()
+                                                .inset_0()
+                                                .size_full()
+                                                .debug_selector(|| "terminal-output-fade".into())
+                                                .bg(linear_gradient(
+                                                    0.,
+                                                    linear_color_stop(terminal_background, 0.),
+                                                    linear_color_stop(
+                                                        terminal_background.opacity(0.),
+                                                        0.4,
+                                                    ),
+                                                ))
+                                                .block_mouse_except_scroll(),
+                                        )
+                                    },
+                                )
                                 .into_any_element()
                         })),
                 )
-                .children(preview_toggle)
+                .when_some(preview, |this, preview| {
+                    this.child(div().px_2().pt_1().pb_2().child(
+                        self.render_tool_output_preview_toggle(
+                            format!("terminal-output-toggle-{}", terminal.entity_id()).into(),
+                            preview.total_lines,
+                            preview.fully_shown,
+                            tool_call.id.clone(),
+                            cx,
+                        ),
+                    ))
+                })
             })
             .when_some(confirmation_options, |this, options| {
                 let is_first = self.is_first_tool_call(active_session_id, &tool_call.id, cx);
@@ -8653,6 +8813,7 @@ impl ThreadView {
                         card_header_id.clone(),
                         true,
                         tool_call.label.clone(),
+                        None,
                         window,
                         cx,
                     ))
@@ -10834,43 +10995,53 @@ impl ThreadView {
         tool_call_id: acp_v1::ToolCallId,
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
-        let (label, selector) = if fully_shown {
-            (SharedString::from("Show less"), "tool-output-show-less")
+        let (label, icon, selector) = if fully_shown {
+            (
+                SharedString::from("Show less"),
+                IconName::ChevronUp,
+                "tool-output-show-less",
+            )
         } else {
             (
                 SharedString::from(format!("Show all {total_lines} lines")),
+                IconName::ChevronDown,
                 "tool-output-show-all",
             )
         };
-        div().debug_selector(move || selector.into()).child(
-            Button::new(id, label)
-                .label_size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.entry_view_state.update(cx, |state, _| {
-                        state.toggle_tool_output_fully_shown(&tool_call_id);
-                    });
-                    this.apply_terminal_preview_limits(cx);
-                    cx.notify();
-                })),
-        )
+        div()
+            .w_full()
+            .debug_selector(move || selector.into())
+            .child(
+                Button::new(id, label)
+                    .full_width()
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .end_icon(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.entry_view_state.update(cx, |state, _| {
+                            state.toggle_tool_output_fully_shown(&tool_call_id);
+                        });
+                        this.apply_terminal_preview_limits(cx);
+                        cx.notify();
+                    })),
+            )
     }
 
-    /// "Show all M lines" / "Show less" under a terminal whose output is longer than
-    /// `tool_output_preview_lines`.
-    fn render_terminal_preview_toggle(
+    /// How a terminal's output is previewed under `tool_output_preview_lines`: `None`
+    /// when previews are off or the output already fits.
+    fn terminal_output_preview(
         &self,
-        terminal: &Entity<acp_thread::Terminal>,
-        terminal_view: Option<&Entity<TerminalView>>,
+        terminal_view: &Entity<TerminalView>,
         tool_call: &ToolCall,
         window: &Window,
-        cx: &Context<Self>,
-    ) -> Option<impl IntoElement + use<>> {
+        cx: &App,
+    ) -> Option<ToolOutputPreview> {
         let preview_lines = AgentSettings::get_global(cx).tool_output_preview_lines;
         if preview_lines == 0 {
             return None;
         }
-        let terminal_view = terminal_view?.read(cx);
+        let terminal_view = terminal_view.read(cx);
         // Over the embedded maximum the terminal is already a fixed-height scroll box.
         if terminal_view.content_mode(window, cx).is_scrollable() {
             return None;
@@ -10884,18 +11055,12 @@ impl ThreadView {
             .entry_view_state
             .read(cx)
             .is_tool_output_fully_shown(&tool_call.id);
-        Some(
-            div()
-                .px_2()
-                .pb_1()
-                .child(self.render_tool_output_preview_toggle(
-                    format!("terminal-output-toggle-{}", terminal.entity_id()).into(),
-                    total_lines,
-                    fully_shown,
-                    tool_call.id.clone(),
-                    cx,
-                )),
-        )
+        Some(ToolOutputPreview {
+            preview_lines,
+            total_lines,
+            fully_shown,
+            clamped: !fully_shown,
+        })
     }
 
     /// Sets every terminal in this thread to show the lines `tool_output_preview_lines` and the

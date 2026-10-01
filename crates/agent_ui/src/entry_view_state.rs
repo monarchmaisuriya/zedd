@@ -51,6 +51,10 @@ pub struct EntryViewState {
     expanded_tool_calls: HashSet<acp_v1::ToolCallId>,
     /// Tool calls whose output the user chose to show beyond `tool_output_preview_lines`.
     fully_shown_tool_outputs: HashSet<acp_v1::ToolCallId>,
+    /// Terminal tool calls whose command was taller than its collapsed height when last laid out.
+    overflowing_commands: HashSet<acp_v1::ToolCallId>,
+    /// Terminal tool calls whose collapsed command the user chose to show in full.
+    expanded_commands: HashSet<acp_v1::ToolCallId>,
 }
 
 impl EntryViewState {
@@ -74,6 +78,8 @@ impl EntryViewState {
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
             fully_shown_tool_outputs: HashSet::default(),
+            overflowing_commands: HashSet::default(),
+            expanded_commands: HashSet::default(),
         }
     }
 
@@ -106,6 +112,33 @@ impl EntryViewState {
     pub(crate) fn toggle_tool_output_fully_shown(&mut self, tool_call_id: &acp_v1::ToolCallId) {
         if !self.fully_shown_tool_outputs.remove(tool_call_id) {
             self.fully_shown_tool_outputs.insert(tool_call_id.clone());
+        }
+    }
+
+    pub(crate) fn command_overflows(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.overflowing_commands.contains(tool_call_id)
+    }
+
+    /// Returns whether the recorded state changed.
+    pub(crate) fn set_command_overflows(
+        &mut self,
+        tool_call_id: &acp_v1::ToolCallId,
+        overflows: bool,
+    ) -> bool {
+        if overflows {
+            self.overflowing_commands.insert(tool_call_id.clone())
+        } else {
+            self.overflowing_commands.remove(tool_call_id)
+        }
+    }
+
+    pub(crate) fn is_command_expanded(&self, tool_call_id: &acp_v1::ToolCallId) -> bool {
+        self.expanded_commands.contains(tool_call_id)
+    }
+
+    pub(crate) fn toggle_command_expanded(&mut self, tool_call_id: &acp_v1::ToolCallId) {
+        if !self.expanded_commands.remove(tool_call_id) {
+            self.expanded_commands.insert(tool_call_id.clone());
         }
     }
 
