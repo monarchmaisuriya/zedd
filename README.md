@@ -16,6 +16,14 @@ zedd is a personal fork of the [Zed](https://github.com/zed-industries/zed) code
 - **Fork a thread** from any message or reply.
 - **Background tasks:** a list of the agent's background work (a dev server, a monitor) with a Stop button. It fills in once the Claude adapter ships [agentclientprotocol/claude-agent-acp#1206](https://github.com/agentclientprotocol/claude-agent-acp/pull/1206).
 
+### Built-in browser
+
+- **Browser panel** (right dock, `browser panel: toggle focus`): tabs, back, forward, reload, and an address bar. zedd draws pages from your installed Chrome (or Chromium, Edge, Brave) running in the background, so menus and popups never hide behind the page. Set `browser.chrome_path` to pick a browser.
+- **Agents use the same page:** in local projects, zedd's agent and external agents such as Claude Code get browser tools: open a page, read it as a list of elements, click, type, press keys, take a screenshot, read the console, run JavaScript, switch tabs, and answer dialogs. The panel opens when an agent uses it. Turn this off with `"browser": { "agent_tools": false }`.
+- **Element picker:** the crosshair button lets you click an element on the page; its markup and selector go into the agent's message box.
+- **Detect dev server:** on an empty panel, finds web servers started from the project's folders and opens one.
+- The browser keeps its own profile, so logins persist and stay separate from your everyday browser. Chrome exits with zedd.
+
 ### Reviewing agent work
 
 - **Branch review:** "Review Branch with Agent" in the git panel menu (or `git: review branch`) asks the agent to check your branch for bugs and security issues.

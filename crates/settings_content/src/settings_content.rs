@@ -224,6 +224,9 @@ pub struct SettingsContent {
     /// Default: VSCode
     pub base_keymap: Option<BaseKeymapContent>,
 
+    /// Configuration for the browser panel and the browser tools agents get.
+    pub browser: Option<BrowserSettingsContent>,
+
     /// Configuration for the collab panel visual settings.
     pub collaboration_panel: Option<PanelSettingsContent>,
 
@@ -403,7 +406,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
         call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
-        agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
+        agent_servers, audio, auto_update, base_keymap, browser, collaboration_panel, debugger, diagnostics,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
@@ -1167,6 +1170,33 @@ pub enum HourFormat {
     #[default]
     Hour12,
     Hour24,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct BrowserSettingsContent {
+    /// Whether to show the browser panel button in the status bar.
+    ///
+    /// Default: true
+    pub button: Option<bool>,
+    /// Where to dock the browser panel.
+    ///
+    /// Default: right
+    pub dock: Option<DockSide>,
+    /// Default width of the browser panel, in pixels.
+    ///
+    /// Default: 640
+    pub default_width: Option<PixelSetting>,
+    /// The Chromium-based browser to run. When unset, zedd uses the first of Chrome, Chromium,
+    /// Edge or Brave it finds in /Applications.
+    ///
+    /// Default: null
+    pub chrome_path: Option<String>,
+    /// Whether agents in local projects get tools to open pages in the browser panel, read
+    /// them, click, type, and take screenshots.
+    ///
+    /// Default: true
+    pub agent_tools: Option<bool>,
 }
 
 #[with_fallible_options]

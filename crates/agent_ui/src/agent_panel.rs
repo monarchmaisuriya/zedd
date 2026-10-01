@@ -25,10 +25,10 @@ use serde::{Deserialize, Serialize};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
-        ResolveConflictsWithAgent, ReviewBranchDiff, ReviewCommentContent, SelectAgent,
-        SendReviewComments,
+        AddBrowserElementToThread, AddSelectionToThread, ConflictContent, LogoutAgent,
+        OpenSettings, ReauthenticateAgent, ResetAgentZoom, ResetOnboarding,
+        ResolveConflictedFilesWithAgent, ResolveConflictsWithAgent, ReviewBranchDiff,
+        ReviewCommentContent, SelectAgent, SendReviewComments,
     },
     assistant::{
         FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
@@ -577,6 +577,26 @@ pub fn init(cx: &mut App) {
                 .register_action(|workspace, action: &SendReviewComments, window, cx| {
                     send_review_comments(workspace, &action.comments, None, window, cx);
                 })
+                .register_action(
+                    |workspace, action: &AddBrowserElementToThread, window, cx| {
+                        let Some(agent_panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        if !agent_panel.focus_handle(cx).contains_focused(window, cx) {
+                            workspace.toggle_panel_focus::<AgentPanel>(window, cx);
+                        }
+                        let description = action.description.clone();
+                        agent_panel.update(cx, |_, cx| {
+                            cx.defer_in(window, move |panel, window, cx| {
+                                if let Some(conversation_view) = panel.active_conversation_view() {
+                                    conversation_view.update(cx, |conversation_view, cx| {
+                                        conversation_view.insert_text(&description, window, cx);
+                                    });
+                                }
+                            });
+                        });
+                    },
+                )
                 .register_action(
                     |workspace, action: &ResolveConflictsWithAgent, window, cx| {
                         let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
@@ -8989,6 +9009,56 @@ mod tests {
                 && transcript.contains("Rename this"),
             "the active thread should receive the review comments, got: {transcript}"
         );
+    }
+
+    #[gpui::test]
+    async fn test_browser_element_lands_in_the_message_box(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+
+        let description = "Element picked in the browser at http://localhost:3000/:\n```html\n<button>Buy</button>\n```\n";
+        workspace.update_in(cx, |_, window, cx| {
+            window.dispatch_action(
+                Box::new(AddBrowserElementToThread {
+                    description: description.to_string(),
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let text = panel.read_with(cx, |panel, cx| {
+            let conversation_view = panel.active_conversation_view().unwrap();
+            let thread_view = conversation_view.read(cx).root_thread_view().unwrap();
+            thread_view.read(cx).message_editor.read(cx).text(cx)
+        });
+        assert_eq!(text, description);
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(panel.focus_handle(cx).contains_focused(window, cx));
+        });
     }
 
     #[test]
