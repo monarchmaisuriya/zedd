@@ -8465,19 +8465,7 @@ impl ThreadView {
                     | ToolCallContent::DiffPatch { .. }
             )
         });
-        let verb = match tool_call.kind() {
-            acp_v2::ToolKind::Read => ToolVerb::Read,
-            acp_v2::ToolKind::Edit => ToolVerb::Edit,
-            acp_v2::ToolKind::Delete => ToolVerb::Delete,
-            acp_v2::ToolKind::Move => ToolVerb::Move,
-            acp_v2::ToolKind::Search => ToolVerb::Search,
-            acp_v2::ToolKind::Execute => ToolVerb::Execute,
-            acp_v2::ToolKind::Think => ToolVerb::Think,
-            acp_v2::ToolKind::Fetch => ToolVerb::Fetch,
-            acp_v2::ToolKind::SwitchMode => ToolVerb::SwitchMode,
-            _ if has_diff => ToolVerb::Edit,
-            _ => ToolVerb::Other,
-        };
+        let verb = tool_run_summary::verb_for_kind(tool_call.kind(), has_diff);
         let file_name = || {
             tool_call.locations.first().and_then(|location| {
                 location

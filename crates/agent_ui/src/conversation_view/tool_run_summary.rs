@@ -1,6 +1,8 @@
 //! Wording for runs of tool calls folded into one line of the agent transcript,
 //! e.g. "Searched code, read 3 files" or "Edited main.rs".
 
+use agent_client_protocol::schema::v2 as acp_v2;
+
 /// What a tool call did, as far as its wording is concerned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolVerb {
@@ -11,9 +13,25 @@ pub(crate) enum ToolVerb {
     Search,
     Execute,
     Fetch,
-    Think,
     SwitchMode,
     Other,
+}
+
+/// The verb for a tool's ACP kind. A tool without a kind that names an action is told
+/// by its title: agents send `think` for subagents, task lists and compaction alike.
+pub(crate) fn verb_for_kind(kind: &acp_v2::ToolKind, has_diff: bool) -> ToolVerb {
+    match kind {
+        acp_v2::ToolKind::Read => ToolVerb::Read,
+        acp_v2::ToolKind::Edit => ToolVerb::Edit,
+        acp_v2::ToolKind::Delete => ToolVerb::Delete,
+        acp_v2::ToolKind::Move => ToolVerb::Move,
+        acp_v2::ToolKind::Search => ToolVerb::Search,
+        acp_v2::ToolKind::Execute => ToolVerb::Execute,
+        acp_v2::ToolKind::Fetch => ToolVerb::Fetch,
+        acp_v2::ToolKind::SwitchMode => ToolVerb::SwitchMode,
+        _ if has_diff => ToolVerb::Edit,
+        _ => ToolVerb::Other,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,8 +126,6 @@ fn past_phrase(group: &[&ToolSummaryItem]) -> Option<String> {
         ToolVerb::Execute => format!("ran {count} commands"),
         ToolVerb::Fetch if count == 1 => "fetched a page".to_string(),
         ToolVerb::Fetch => format!("fetched {count} pages"),
-        ToolVerb::Think if count == 1 => "thought".to_string(),
-        ToolVerb::Think => format!("thought {count} times"),
         ToolVerb::SwitchMode => "switched mode".to_string(),
         ToolVerb::Other => match (first.subject.as_deref(), count) {
             (Some(name), 1) => format!("used {name}"),
@@ -138,7 +154,6 @@ fn present_phrase(item: &ToolSummaryItem) -> String {
         ToolVerb::Search => "searching code".to_string(),
         ToolVerb::Execute => format!("running {}", subject.unwrap_or("a command")),
         ToolVerb::Fetch => format!("fetching {}", subject.unwrap_or("a page")),
-        ToolVerb::Think => "thinking".to_string(),
         ToolVerb::SwitchMode => "switching mode".to_string(),
         ToolVerb::Other => format!("using {}", subject.unwrap_or("a tool")),
     }
@@ -249,6 +264,20 @@ mod tests {
             "Grep foo in src"
         );
         assert_eq!(member_line(&item(ToolVerb::Fetch, None)), "Fetched a page");
+    }
+
+    #[test]
+    fn think_kind_is_told_by_its_title() {
+        let verb = verb_for_kind(&acp_v2::ToolKind::Think, false);
+        assert_eq!(verb, ToolVerb::Other);
+        assert_eq!(
+            run_summary(&[item(verb, Some("Explore codebase"))]),
+            "Used Explore codebase"
+        );
+        assert_eq!(
+            verb_for_kind(&acp_v2::ToolKind::Other, true),
+            ToolVerb::Edit
+        );
     }
 
     #[test]

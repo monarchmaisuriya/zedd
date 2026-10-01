@@ -143,6 +143,7 @@ Criterion coverage:
 - Deviation (structural): the view mode and folding rules live in `EntryViewState`, not `ThreadView`, so thread search uses the same rules as drawing: folded tool labels and hidden thinking are no longer searchable. Three search tests now name the view they test.
 - Deviation: debug selectors added to the thinking block and the permission buttons so tests can see them.
 - Part 4: 12 card-centric tests set verbose; new tests: fold/open/close, permission never folded (fails without the rule), verbose then switch to normal, normal hides thinking. Suites: `agent_ui` 498, `agent` 761, `agent_settings` 44, `settings` 46, `settings_content` 50, `settings_ui` 57, zed keymap and bundled settings tests 3; clippy clean; rustfmt clean.
+- Follow-up: ACP `think` kind is worded by the tool's title like `other` (`verb_for_kind`), because agents send `think` for subagents, task lists and compaction; the Claude Code adapter does (reporters/agent.js, interaction.js, compaction.js), the native agent never does. Claude Code subagents stay a folded line, matching the desktop app (M's call). Test `think_kind_is_told_by_its_title`; `agent_ui` 499; clippy and rustfmt clean.
 
 ## Open questions
 
