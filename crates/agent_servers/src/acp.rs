@@ -44,9 +44,15 @@ use util::path_list::PathList;
 use util::process::Child;
 
 use anyhow::{Context as _, Result};
-use gpui::{App, AppContext as _, AsyncApp, Entity, SharedString, Subscription, Task, WeakEntity};
+use gpui::{
+    App, AppContext as _, AsyncApp, BackgroundExecutor, Entity, SharedString, Subscription, Task,
+    WeakEntity,
+};
 
-use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
+use acp_thread::{
+    AcpThread, AuthRequired, BackgroundTask, BackgroundTaskState, BackgroundTaskUpdate, LoadError,
+    TerminalProviderEvent,
+};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
@@ -55,6 +61,8 @@ use crate::{CURSOR_ID, GEMINI_ID};
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const EXIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long an agent gets to exit after SIGTERM before its process group is killed.
+const AGENT_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 async fn exited_load_error_after_drain(
     status: ExitStatus,
@@ -286,6 +294,7 @@ pub struct AcpConnection {
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
+    background_executor: BackgroundExecutor,
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
@@ -294,6 +303,8 @@ pub struct AcpConnection {
     _dispatch_task: Task<()>,
     _wait_task: Task<Result<()>>,
     _stderr_task: Shared<Task<()>>,
+    /// Resolves when the agent process exits or the transport closes.
+    closed: Option<Shared<Task<()>>>,
 }
 
 #[derive(Clone, Default)]
@@ -628,6 +639,33 @@ fn client_builder(
             agent_client_protocol::on_receive_request!(),
         )
         // --- Notification handlers (agent→client) ---
+        // Runs before the typed session update handler, whose schema has no async task kinds.
+        .on_receive_notification(
+            {
+                let dispatch_sender = dispatch_sender.clone();
+                async move |message: agent_client_protocol::UntypedMessage, connection| {
+                    match parse_async_task_notification(&message) {
+                        None => Ok(agent_client_protocol::Handled::No {
+                            message: (message, connection),
+                            retry: false,
+                        }),
+                        Some(Ok(notification)) => {
+                            enqueue_notification(
+                                &dispatch_sender,
+                                notification,
+                                handle_async_task_notification,
+                            );
+                            Ok(agent_client_protocol::Handled::Yes)
+                        }
+                        Some(Err(error)) => {
+                            log::error!("Malformed async task update: {error:#}");
+                            Ok(agent_client_protocol::Handled::Yes)
+                        }
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         .on_receive_notification(
             on_notification!(handle_session_notification),
             agent_client_protocol::on_receive_notification!(),
@@ -645,6 +683,8 @@ fn client_capabilities_for_agent(
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        // Asks the Claude adapter for `async_task_*` session updates.
+        (ASYNC_TASKS_META_KEY.into(), true.into()),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -732,10 +772,12 @@ impl AcpConnection {
         let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
         let connection_future =
             connect_client_future("zed", transport, dispatch_tx.clone(), connection_tx);
+        let (transport_closed_tx, transport_closed_rx) = futures::channel::oneshot::channel();
         let io_task = cx.background_spawn(async move {
             if let Err(err) = connection_future.await {
                 log::error!("ACP connection error: {err}");
             }
+            transport_closed_tx.send(()).ok();
         });
 
         let connection_rx = async move {
@@ -849,6 +891,7 @@ impl AcpConnection {
             return Err(UnsupportedVersion.into());
         }
 
+        let (process_exited_tx, process_exited_rx) = futures::channel::oneshot::channel();
         let wait_task = cx.spawn({
             let sessions = sessions.clone();
             let debug_log = debug_log.clone();
@@ -857,9 +900,16 @@ impl AcpConnection {
                 let load_error =
                     exited_load_error_after_drain(status, drained, &debug_log, cx).await;
                 emit_load_error_to_all_sessions(&sessions, load_error, cx);
+                process_exited_tx.send(()).ok();
                 anyhow::Ok(())
             }
         });
+        // A dropped sender also counts: the task that watches for the end has itself ended.
+        let closed = cx
+            .background_spawn(async move {
+                futures::future::select(transport_closed_rx, process_exited_rx).await;
+            })
+            .shared();
 
         let agent_info = response.agent_info;
         let reads_air_fork_points = agent_info
@@ -942,8 +992,10 @@ impl AcpConnection {
             dispatch_tx,
             _dispatch_task: dispatch_task,
             _wait_task: wait_task,
+            closed: Some(closed),
             _stderr_task: stderr_task,
             child: Some(child),
+            background_executor: cx.background_executor().clone(),
         })
     }
 
@@ -989,6 +1041,8 @@ impl AcpConnection {
             _dispatch_task: dispatch_task,
             _wait_task: Task::ready(Ok(())),
             _stderr_task: Task::ready(()).shared(),
+            closed: None,
+            background_executor: cx.background_executor().clone(),
         }
     }
 
@@ -1508,8 +1562,11 @@ fn emit_load_error_to_all_sessions(
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
-            child.kill().log_err();
+        if let Some(child) = self.child.take() {
+            let grace = self.background_executor.timer(AGENT_TERMINATION_GRACE);
+            self.background_executor
+                .spawn(child.terminate_gracefully(grace))
+                .detach();
         }
     }
 }
@@ -1564,6 +1621,10 @@ fn meta_terminal_auth_task(
 impl AgentConnection for AcpConnection {
     fn agent_id(&self) -> AgentId {
         self.id.clone()
+    }
+
+    fn closed(&self) -> Option<Shared<Task<()>>> {
+        self.closed.clone()
     }
 
     fn telemetry_id(&self) -> SharedString {
@@ -1838,6 +1899,26 @@ impl AgentConnection for AcpConnection {
 
     fn supports_logout(&self) -> bool {
         self.agent_capabilities.auth.logout.is_some()
+    }
+
+    fn stop_background_task(
+        &self,
+        session_id: &acp::SessionId,
+        task_id: SharedString,
+        cx: &mut App,
+    ) -> Task<Result<bool>> {
+        let conn = self.connection.clone();
+        let request = agent_client_protocol::UntypedMessage::new(
+            ASYNC_TASK_STOP_METHOD,
+            serde_json::json!({ "sessionId": session_id, "asyncTaskId": task_id }),
+        );
+        cx.foreground_executor().spawn(async move {
+            let response = conn.send_request(request?).block_task().await?;
+            response
+                .get("stopped")
+                .and_then(serde_json::Value::as_bool)
+                .with_context(|| format!("unexpected async task stop response: {response}"))
+        })
     }
 
     fn logout(&self, cx: &mut App) -> Task<Result<()>> {
@@ -2129,23 +2210,25 @@ pub mod test_support {
                     .lock()
                     .expect("exit status sender lock should not be poisoned") = Some(exit_tx);
                 let connection = harness.connection.clone();
-                let simulate_exit_task = cx.spawn(async move |cx| {
-                    while let Ok(status) = exit_rx.recv().await {
-                        emit_load_error_to_all_sessions(
-                            &connection.sessions,
-                            LoadError::Exited {
-                                status,
-                                stderr: None,
-                            },
-                            cx,
-                        );
-                    }
-                    Ok(())
-                });
+                // A process exits once, so the simulated exit also ends the connection.
+                let simulated_exit = cx
+                    .spawn(async move |cx| {
+                        if let Ok(status) = exit_rx.recv().await {
+                            emit_load_error_to_all_sessions(
+                                &connection.sessions,
+                                LoadError::Exited {
+                                    status,
+                                    stderr: None,
+                                },
+                                cx,
+                            );
+                        }
+                    })
+                    .shared();
                 Ok(Rc::new(FakeAcpAgentConnection {
                     inner: harness.connection,
                     _keep_agent_alive: harness.keep_agent_alive,
-                    _simulate_exit_task: simulate_exit_task,
+                    simulated_exit,
                 }) as Rc<dyn AgentConnection>)
             })
         }
@@ -2167,12 +2250,16 @@ pub mod test_support {
     struct FakeAcpAgentConnection {
         inner: Rc<AcpConnection>,
         _keep_agent_alive: Task<anyhow::Result<()>>,
-        _simulate_exit_task: Task<anyhow::Result<()>>,
+        simulated_exit: Shared<Task<()>>,
     }
 
     impl AgentConnection for FakeAcpAgentConnection {
         fn agent_id(&self) -> AgentId {
             self.inner.agent_id()
+        }
+
+        fn closed(&self) -> Option<Shared<Task<()>>> {
+            Some(self.simulated_exit.clone())
         }
 
         fn telemetry_id(&self) -> SharedString {
@@ -2248,6 +2335,15 @@ pub mod test_support {
 
         fn supports_logout(&self) -> bool {
             self.inner.supports_logout()
+        }
+
+        fn stop_background_task(
+            &self,
+            session_id: &acp::SessionId,
+            task_id: SharedString,
+            cx: &mut App,
+        ) -> Task<Result<bool>> {
+            self.inner.stop_background_task(session_id, task_id, cx)
         }
 
         fn logout(&self, cx: &mut App) -> Task<Result<()>> {
@@ -3024,6 +3120,20 @@ mod tests {
             .expect("fake auth flow should receive elicitation response");
         assert_eq!(response.action, acp::ElicitationAction::Decline);
         auth_task.await.expect("auth should complete");
+    }
+
+    #[test]
+    fn client_capabilities_ask_for_async_task_updates() {
+        let capabilities = client_capabilities_for_agent(&AgentId::new("claude-acp"), false);
+        let meta = capabilities
+            .meta
+            .expect("expected client capabilities meta");
+
+        assert_eq!(meta.get("async-tasks"), Some(&serde_json::json!(true)));
+        assert!(
+            meta.get("jetbrains").is_none(),
+            "asking for tasks must not turn on the adapter's AIR mode"
+        );
     }
 
     #[test]
@@ -4003,6 +4113,147 @@ mod tests {
             }
             error => panic!("expected exited load error, got: {error:?}"),
         };
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn async_task_updates_reach_the_thread_and_stop_asks_the_agent(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        cx.executor().allow_parking();
+
+        let directory = tempfile::tempdir().expect("create working directory");
+        let project = project::Project::example([directory.path()], &mut cx.to_async()).await;
+        let agent_server_store =
+            project.read_with(cx, |project, _| project.agent_server_store().downgrade());
+        let session_id = acp::SessionId::new("tasks");
+        let initialize_response =
+            serde_json::to_string(&acp::InitializeResponse::new(ProtocolVersion::V1)).unwrap();
+        let session_response =
+            serde_json::to_string(&acp::NewSessionResponse::new(session_id.clone())).unwrap();
+        let prompt_response =
+            serde_json::to_string(&acp::PromptResponse::new(acp::StopReason::EndTurn)).unwrap();
+        let task_update = |update: serde_json::Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": { "sessionId": "tasks", "update": update },
+            })
+        };
+        let spawned = task_update(serde_json::json!({
+            "sessionUpdate": "async_task_spawned",
+            "asyncTaskId": "task-1",
+            "name": "npm run dev",
+            "taskType": "shell",
+            "description": "Dev server",
+            "showInTranscript": true,
+            "canStop": true,
+            "toolCallId": "toolu_1",
+        }));
+        let progress = task_update(serde_json::json!({
+            "sessionUpdate": "async_task_progress",
+            "asyncTaskId": "task-1",
+            "summary": "Listening on 3000",
+        }));
+        let stopped = task_update(serde_json::json!({
+            "sessionUpdate": "async_task_state_update",
+            "asyncTaskId": "task-1",
+            "state": "stopped",
+        }));
+        let script = format!(
+            r#"
+read_request() {{
+    IFS= read -r request || exit 2
+    request_id=$(printf '%s' "$request" | sed -n 's/.*"id":\("[^"]*"\).*/\1/p')
+    test -n "$request_id" || exit 3
+}}
+respond() {{
+    printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$request_id" "$1"
+}}
+read_request
+respond '{initialize_response}'
+read_request
+respond '{session_response}'
+read_request
+printf '%s\n' '{spawned}'
+printf '%s\n' '{progress}'
+respond '{prompt_response}'
+read_request
+case "$request" in *'"_session/async_task/stop"'*) ;; *) exit 9 ;; esac
+case "$request" in *'"asyncTaskId":"task-1"'*) ;; *) exit 10 ;; esac
+respond '{{"stopped":true}}'
+printf '%s\n' '{stopped}'
+cat > /dev/null
+"#
+        );
+        let command = AgentServerCommand {
+            path: "/bin/sh".into(),
+            args: vec!["-c".into(), script],
+            env: None,
+        };
+        let connection = Rc::new(
+            AcpConnection::stdio(
+                AgentId::new("task-agent"),
+                project.clone(),
+                command,
+                agent_server_store,
+                None,
+                HashMap::default(),
+                &mut cx.to_async(),
+            )
+            .await
+            .expect("initialize scripted agent"),
+        );
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[directory.path()]), cx)
+            })
+            .await
+            .expect("create scripted session");
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Start the dev server", cx))
+            .await
+            .expect("prompt response")
+            .expect("prompt should finish");
+        cx.run_until_parked();
+
+        let tasks = thread.read_with(cx, |thread, _| thread.background_tasks().to_vec());
+        assert_eq!(
+            tasks,
+            vec![BackgroundTask {
+                id: "task-1".into(),
+                name: "npm run dev".into(),
+                description: "Dev server".into(),
+                state: BackgroundTaskState::Running,
+                summary: Some("Listening on 3000".into()),
+                tool_call_id: Some(acp::ToolCallId::new("toolu_1")),
+                can_stop: true,
+            }]
+        );
+
+        let stopped = cx
+            .update(|cx| connection.stop_background_task(&session_id, "task-1".into(), cx))
+            .await
+            .expect("stop request");
+        assert!(stopped);
+        let mut state = None;
+        for _ in 0..500 {
+            cx.run_until_parked();
+            state = thread.read_with(cx, |thread, _| {
+                thread.background_tasks().first().map(|task| task.state)
+            });
+            if state == Some(BackgroundTaskState::Stopped) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(state, Some(BackgroundTaskState::Stopped));
     }
 
     #[cfg(unix)]
@@ -5757,6 +6008,152 @@ fn handle_create_elicitation(
             );
         }
     }
+}
+
+const ASYNC_TASKS_META_KEY: &str = "async-tasks";
+const ASYNC_TASK_STOP_METHOD: &str = "_session/async_task/stop";
+
+/// A background task change from the Claude adapter's `async_task_*` session updates.
+struct AsyncTaskNotification {
+    session_id: acp::SessionId,
+    update: BackgroundTaskUpdate,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AsyncTaskNotificationWire {
+    session_id: String,
+    update: AsyncTaskUpdateWire,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "sessionUpdate", rename_all = "snake_case")]
+enum AsyncTaskUpdateWire {
+    #[serde(rename_all = "camelCase")]
+    AsyncTaskSpawned {
+        async_task_id: String,
+        name: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default)]
+        can_stop: bool,
+        tool_call_id: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    AsyncTaskProgress {
+        async_task_id: String,
+        description: Option<String>,
+        summary: Option<String>,
+        tool_call_id: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    AsyncTaskStateUpdate {
+        async_task_id: String,
+        state: AsyncTaskStateWire,
+        summary: Option<String>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AsyncTaskStateWire {
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+/// `None` when the message is not an async task session update.
+fn parse_async_task_notification(
+    message: &agent_client_protocol::UntypedMessage,
+) -> Option<Result<AsyncTaskNotification>> {
+    let kind = message
+        .params
+        .get("update")?
+        .get("sessionUpdate")?
+        .as_str()?;
+    if message.method != "session/update" || !kind.starts_with("async_task_") {
+        return None;
+    }
+    Some(
+        serde_json::from_value::<AsyncTaskNotificationWire>(message.params.clone())
+            .with_context(|| format!("parsing {kind}"))
+            .map(|wire| AsyncTaskNotification {
+                session_id: acp::SessionId::new(wire.session_id),
+                update: background_task_update(wire.update),
+            }),
+    )
+}
+
+fn background_task_update(update: AsyncTaskUpdateWire) -> BackgroundTaskUpdate {
+    match update {
+        AsyncTaskUpdateWire::AsyncTaskSpawned {
+            async_task_id,
+            name,
+            description,
+            can_stop,
+            tool_call_id,
+        } => BackgroundTaskUpdate::Spawned(BackgroundTask {
+            id: async_task_id.into(),
+            name: name.into(),
+            description: description.into(),
+            state: BackgroundTaskState::Running,
+            summary: None,
+            tool_call_id: tool_call_id.map(acp::ToolCallId::new),
+            can_stop,
+        }),
+        AsyncTaskUpdateWire::AsyncTaskProgress {
+            async_task_id,
+            description,
+            summary,
+            tool_call_id,
+        } => BackgroundTaskUpdate::Progress {
+            id: async_task_id.into(),
+            description: description.map(Into::into),
+            summary: summary.map(Into::into),
+            tool_call_id: tool_call_id.map(acp::ToolCallId::new),
+        },
+        AsyncTaskUpdateWire::AsyncTaskStateUpdate {
+            async_task_id,
+            state,
+            summary,
+        } => BackgroundTaskUpdate::State {
+            id: async_task_id.into(),
+            state: match state {
+                AsyncTaskStateWire::Running => BackgroundTaskState::Running,
+                AsyncTaskStateWire::Paused => BackgroundTaskState::Paused,
+                AsyncTaskStateWire::Completed => BackgroundTaskState::Completed,
+                AsyncTaskStateWire::Failed => BackgroundTaskState::Failed,
+                AsyncTaskStateWire::Stopped => BackgroundTaskState::Stopped,
+            },
+            summary: summary.map(Into::into),
+        },
+    }
+}
+
+fn handle_async_task_notification(
+    notification: AsyncTaskNotification,
+    cx: &mut AsyncApp,
+    ctx: &ClientContext,
+) {
+    let thread = ctx
+        .sessions
+        .borrow()
+        .get(&notification.session_id)
+        .and_then(|session| session.thread.upgrade());
+    let Some(thread) = thread else {
+        log::warn!(
+            "Received an async task update for unknown session: {:?}",
+            notification.session_id
+        );
+        return;
+    };
+    thread
+        .update(cx, |thread, cx| {
+            thread.apply_background_task_update(notification.update, cx)
+        })
+        .log_err();
 }
 
 fn handle_complete_elicitation(

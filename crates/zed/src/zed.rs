@@ -6136,6 +6136,9 @@ mod tests {
     }
 
     pub(crate) fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
+        // Without an app database of its own, a test shares one with every parallel test, which
+        // then restore or garbage collect each other's sessions.
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
         init_test_with_state(cx, cx.update(AppState::test))
     }
 

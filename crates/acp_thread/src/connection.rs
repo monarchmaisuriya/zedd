@@ -3,6 +3,7 @@ use agent_client_protocol::schema::v1 as acp_v1;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet, IndexMap};
+use futures::future::Shared;
 use gpui::{Entity, SharedString, Task};
 use language_model::DisabledReason;
 use project::{AgentId, Project};
@@ -121,6 +122,12 @@ pub trait AgentConnection {
         Task::ready(Err(anyhow::Error::msg("Loading sessions is not supported")))
     }
 
+    /// Whether the agent saves a session's unsent prompt itself, so it survives a restart.
+    /// When it does not, the client keeps the unsent prompt.
+    fn persists_draft_prompt(&self) -> bool {
+        false
+    }
+
     /// Whether this agent supports closing existing sessions.
     fn supports_close_session(&self) -> bool {
         false
@@ -221,6 +228,25 @@ pub trait AgentConnection {
         _cx: &App,
     ) -> Option<Rc<dyn AgentSessionTruncate>> {
         None
+    }
+
+    /// Resolves once this connection can no longer serve requests, e.g. its agent process
+    /// exited or its transport closed. `None` for connections that never close on their own.
+    fn closed(&self) -> Option<Shared<Task<()>>> {
+        None
+    }
+
+    /// Asks the agent to stop one of its background tasks. Resolves to whether it stopped; a
+    /// task that already finished does not.
+    fn stop_background_task(
+        &self,
+        _session_id: &acp_v1::SessionId,
+        _task_id: SharedString,
+        _cx: &mut App,
+    ) -> Task<Result<bool>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "this agent does not run background tasks"
+        )))
     }
 
     fn fork(&self, _session_id: &acp_v1::SessionId, _cx: &App) -> Option<Rc<dyn AgentSessionFork>> {

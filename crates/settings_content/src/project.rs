@@ -85,12 +85,17 @@ pub struct ProjectSettingsContent {
     ///
     /// Default: false
     pub disable_ai: Option<SaturatingBool>,
+
+    /// A command that checks the agent's work after each agent turn that used tools. When it
+    /// fails, the agent is asked once to fix the failure.
+    pub agent_verification: Option<AgentVerificationSettingsContent>,
 }
 
 crate::fallible_options::flattened_deserialize!(ProjectSettingsContent {
     sections: { all_languages, worktree },
     options: {
         terminal, context_server_timeout, load_direnv, git_hosting_providers, disable_ai,
+        agent_verification,
     },
     defaults: { lsp, dap, context_servers },
 });
@@ -117,6 +122,24 @@ pub enum ScanSymlinksSetting {
     /// Only scan symlinked directories when they've been expanded in the workspace
     #[default]
     Expanded,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct AgentVerificationSettingsContent {
+    /// The shell command to run in the project root, for example `cargo test`.
+    /// Verification is off while this is unset.
+    ///
+    /// Default: null
+    pub command: Option<String>,
+    /// How long the command may run before it counts as failed.
+    ///
+    /// Default: 600
+    pub timeout_seconds: Option<u64>,
+    /// Whether new agent threads verify their turns. Each thread can switch it off.
+    ///
+    /// Default: true
+    pub enabled_by_default: Option<bool>,
 }
 
 #[with_fallible_options]

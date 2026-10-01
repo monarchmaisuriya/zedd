@@ -46246,6 +46246,60 @@ fn add_test_comment(
 }
 
 #[gpui::test]
+fn test_send_review_to_agent_sends_comments_with_their_code(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    cx.update(|cx| {
+        let sent = sent.clone();
+        cx.on_action(move |action: &zed_actions::agent::SendReviewComments, _| {
+            sent.lock().extend(action.comments.clone());
+        });
+    });
+    let editor = cx.add_window(|window, cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        editor.set_text("one\ntwo\nthree\nfour", window, cx);
+        editor
+    });
+
+    editor
+        .update(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let range =
+                snapshot.anchor_before(Point::new(1, 0))..snapshot.anchor_before(Point::new(2, 3));
+            editor.add_review_comment(
+                test_hunk_key("src/lib.rs"),
+                "Rename this".to_string(),
+                range,
+                cx,
+            );
+            editor.send_review_to_agent(&SendReviewToAgent, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    assert_eq!(
+        *sent.lock(),
+        vec![zed_actions::agent::ReviewCommentContent {
+            file_path: "src/lib.rs".to_string(),
+            start_row: 1,
+            end_row: 2,
+            code: "two\nthree".to_string(),
+            comment: "Rename this".to_string(),
+        }]
+    );
+    editor
+        .update(cx, |editor, _window, _cx| {
+            assert_eq!(
+                editor.total_review_comment_count(),
+                0,
+                "sent comments leave the editor"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn test_review_comment_add_to_hunk(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

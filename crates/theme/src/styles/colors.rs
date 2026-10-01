@@ -464,8 +464,14 @@ pub enum ThemeColorField {
 
 impl ThemeColors {
     pub fn surface_overlay_background(&self) -> Hsla {
-        if self.background.a >= 1.0 || self.surface_background.a >= 1.0 {
-            self.background.blend(self.surface_background)
+        self.overlay_background(self.surface_background)
+    }
+
+    /// `base` made opaque enough to hide what scrolls under it: blended onto the window
+    /// background when either is opaque, otherwise the panel overlay color.
+    pub fn overlay_background(&self, base: Hsla) -> Hsla {
+        if self.background.a >= 1.0 || base.a >= 1.0 {
+            self.background.blend(base)
         } else {
             self.panel_overlay_background
         }

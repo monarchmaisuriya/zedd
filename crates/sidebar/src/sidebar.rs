@@ -28,10 +28,11 @@ use feature_flags::{
     AgentThreadWorktreeLabel, AgentThreadWorktreeLabelFlag, FeatureFlag, FeatureFlagAppExt as _,
 };
 use gpui::{
-    Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Empty, Entity,
+    EntityId, FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render,
+    SharedString, StyleRefinement, Subscription, Task, TaskExt, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowHandle, linear_color_stop, linear_gradient, list, prelude::*,
+    px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -764,6 +765,54 @@ fn create_worktree_in_workspace(
 /// change via `update_entries` → `rebuild_contents`. Avoid adding
 /// incremental or inter-event coordination state — if something can
 /// be computed from the current world state, compute it in the rebuild.
+/// The line between project groups.
+const GROUP_SEPARATOR_WIDTH: Pixels = px(1.);
+
+/// The sidebar is painted like a code file.
+fn sidebar_background(colors: &theme::ThemeColors) -> gpui::Hsla {
+    colors.editor_background
+}
+
+/// The sidebar background, opaque enough to hide rows scrolling under a sticky header.
+fn sidebar_overlay_background(colors: &theme::ThemeColors) -> gpui::Hsla {
+    colors.overlay_background(sidebar_background(colors))
+}
+
+/// One sidebar row as its own view. A row that animates, like a running thread's spinner,
+/// redraws alone while the other rows reuse their last frame.
+struct SidebarRow {
+    sidebar: WeakEntity<Sidebar>,
+    ix: usize,
+    #[cfg(test)]
+    render_count: usize,
+    _sidebar_changed: Subscription,
+}
+
+impl SidebarRow {
+    fn new(sidebar: Entity<Sidebar>, ix: usize, cx: &mut Context<Self>) -> Self {
+        Self {
+            _sidebar_changed: cx.observe(&sidebar, |_, _, cx| cx.notify()),
+            sidebar: sidebar.downgrade(),
+            ix,
+            #[cfg(test)]
+            render_count: 0,
+        }
+    }
+}
+
+impl Render for SidebarRow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.render_count += 1;
+        }
+        let ix = self.ix;
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.render_list_entry(ix, window, cx))
+            .unwrap_or_else(|_| Empty.into_any_element())
+    }
+}
+
 pub struct Sidebar {
     multi_workspace: WeakEntity<MultiWorkspace>,
     width: Pixels,
@@ -776,6 +825,8 @@ pub struct Sidebar {
     filter_editor: Entity<Editor>,
     rename_editor: Entity<Editor>,
     list_state: ListState,
+    /// One cached view per list row, indexed like `contents.entries`.
+    row_views: Vec<Entity<SidebarRow>>,
     contents: SidebarContents,
     /// The index of the list item that currently has the keyboard focus
     ///
@@ -944,6 +995,7 @@ impl Sidebar {
             filter_editor,
             rename_editor,
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
+            row_views: Vec::new(),
             contents: SidebarContents::default(),
             selection: None,
             active_entry: None,
@@ -2212,6 +2264,49 @@ impl Sidebar {
             });
     }
 
+    /// Lays row `ix` out at its known height as a cached view, so it renders only when it
+    /// changes instead of whenever the sidebar redraws.
+    fn render_list_row(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        while self.row_views.len() <= ix {
+            let sidebar = cx.entity();
+            let row_ix = self.row_views.len();
+            self.row_views
+                .push(cx.new(|cx| SidebarRow::new(sidebar, row_ix, cx)));
+        }
+        let height = self.row_height(ix, window, cx);
+        self.row_views[ix]
+            .clone()
+            .cached(StyleRefinement::default().w_full().h(height))
+            .into_any_element()
+    }
+
+    /// The height row `ix` renders at. Rows are built the same way they render, so the two
+    /// cannot disagree; selection and focus never change a row's height.
+    fn row_height(&self, ix: usize, window: &Window, cx: &mut Context<Self>) -> Pixels {
+        match self.contents.entries.get(ix) {
+            Some(ListEntry::ProjectHeader { .. }) => {
+                let separator = if ix > 0 {
+                    GROUP_SEPARATOR_WIDTH
+                } else {
+                    px(0.)
+                };
+                Tab::content_height(cx) + separator
+            }
+            Some(ListEntry::Thread(thread)) => self
+                .thread_item(ix, thread, false, false, cx)
+                .height(window, cx),
+            Some(ListEntry::Terminal(terminal)) => self
+                .terminal_item(ix, terminal, false, false, cx)
+                .height(window, cx),
+            None => px(0.),
+        }
+    }
+
     fn render_list_entry(
         &mut self,
         ix: usize,
@@ -2274,7 +2369,7 @@ impl Sidebar {
         if is_group_header_after_first {
             v_flex()
                 .w_full()
-                .border_t_1()
+                .border_t(GROUP_SEPARATOR_WIDTH)
                 .border_color(cx.theme().colors().border)
                 .child(rendered)
                 .into_any_element()
@@ -2342,9 +2437,9 @@ impl Sidebar {
 
         let color = cx.theme().colors();
         let sidebar_base_bg = if is_sticky {
-            color.surface_overlay_background()
+            sidebar_overlay_background(color)
         } else {
-            color.surface_background
+            sidebar_background(color)
         };
 
         // The fade gradient renders as a visible patch on transparent windows,
@@ -3284,7 +3379,7 @@ impl Sidebar {
             .unwrap_or(px(0.));
 
         let color = cx.theme().colors();
-        let background = color.surface_overlay_background();
+        let background = sidebar_overlay_background(color);
 
         let element = v_flex()
             .absolute()
@@ -6240,14 +6335,15 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn render_thread(
+    /// The row for `thread`; [`ThreadItem::height`] gives its height.
+    fn thread_item(
         &self,
         ix: usize,
         thread: &ThreadEntry,
         is_active: bool,
         is_focused: bool,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> ThreadItem {
         let has_notification = self.contents.is_thread_notified(&thread.metadata.thread_id);
 
         let title: SharedString = thread.metadata.display_title();
@@ -6273,7 +6369,7 @@ impl Sidebar {
         let id = SharedString::from(format!("thread-entry-{}", ix));
 
         let color = cx.theme().colors();
-        let sidebar_bg = color.surface_background;
+        let sidebar_bg = sidebar_background(color);
         let button_hover_bg = color.element_background;
         let button_active_bg = color.element_active;
 
@@ -6301,7 +6397,7 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
-        let thread_item = ThreadItem::new(id, title.clone())
+        ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
             .icon(icon)
             .when(is_draft, |this| {
@@ -6437,7 +6533,6 @@ impl Sidebar {
                 )
             })
             .on_click({
-                let thread_workspace = thread_workspace.clone();
                 cx.listener(move |this, _, window, cx| {
                     this.selection = None;
                     match &thread_workspace {
@@ -6458,7 +6553,21 @@ impl Sidebar {
                         }
                     }
                 })
-            });
+            })
+    }
+
+    fn render_thread(
+        &self,
+        ix: usize,
+        thread: &ThreadEntry,
+        is_active: bool,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let thread_item = self.thread_item(ix, thread, is_active, is_focused, cx);
+        let is_draft = thread.draft.is_some();
+        let title: SharedString = thread.metadata.display_title();
+        let thread_workspace = thread.workspace.clone();
 
         if is_draft || thread.metadata.session_id.is_none() {
             return thread_item.into_any_element();
@@ -6590,19 +6699,20 @@ impl Sidebar {
             .into_any_element()
     }
 
-    fn render_terminal(
+    /// The row for `terminal`; [`ThreadItem::height`] gives its height.
+    fn terminal_item(
         &self,
         ix: usize,
         terminal: &TerminalEntry,
         is_active: bool,
         is_focused: bool,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> ThreadItem {
         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
         let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
         let is_hovered = self.hovered_thread_index == Some(ix);
         let color = cx.theme().colors();
-        let sidebar_bg = color.surface_background;
+        let sidebar_bg = sidebar_background(color);
         let button_hover_bg = color.element_background;
         let button_active_bg = color.element_active;
         let metadata = terminal.metadata.clone();
@@ -6624,7 +6734,7 @@ impl Sidebar {
                 None => (None, display_title, terminal.highlight_positions.clone()),
             };
 
-        let terminal_item = ThreadItem::new(id, title)
+        ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
             .icon(IconName::Terminal)
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
@@ -6683,7 +6793,18 @@ impl Sidebar {
                         cx,
                     );
                 }
-            }));
+            }))
+    }
+
+    fn render_terminal(
+        &self,
+        ix: usize,
+        terminal: &TerminalEntry,
+        is_active: bool,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let terminal_item = self.terminal_item(ix, terminal, is_active, is_focused, cx);
 
         let context_menu_id = SharedString::from(format!("terminal-context-menu-{ix}"));
         let terminal_id = terminal.metadata.terminal_id;
@@ -7944,7 +8065,7 @@ impl Render for Sidebar {
         let sticky_header = self.render_sticky_header(window, cx);
 
         let color = cx.theme().colors();
-        let bg = color.surface_background;
+        let bg = sidebar_background(color);
 
         let no_open_projects = !self.contents.has_open_projects;
         let no_search_results = self.contents.entries.is_empty();
@@ -8042,7 +8163,7 @@ impl Render for Sidebar {
                                     .child(
                                         list(
                                             self.list_state.clone(),
-                                            cx.processor(Self::render_list_entry),
+                                            cx.processor(Self::render_list_row),
                                         )
                                         .flex_1()
                                         .size_full(),

@@ -143,6 +143,8 @@
       "cmd-alt-g b": "git::Blame",
       "cmd-alt-g m": "git::OpenModifiedFiles",
       "cmd-alt-g r": "git::ReviewDiff",
+      "cmd-alt-g c": "editor::AddReviewComment",
+      "cmd-alt-g enter": "editor::SendReviewToAgent",
       "cmd-i": "editor::ShowSignatureHelp",
       "f9": "editor::ToggleBreakpoint",
       "shift-f9": "editor::EditLogBreakpoint",

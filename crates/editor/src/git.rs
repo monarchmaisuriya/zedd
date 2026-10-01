@@ -1121,6 +1121,68 @@ impl Editor {
         cx.notify();
     }
 
+    /// Takes all stored comments from all hunks, clearing the storage.
+    /// Returns a Vec of (hunk_key, comments) pairs.
+    pub(super) fn take_all_review_comments(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Vec<(DiffHunkKey, Vec<StoredReviewComment>)> {
+        // Dismiss all overlays when taking comments (e.g., when sending to agent)
+        self.dismiss_all_diff_review_overlays(cx);
+        let comments = std::mem::take(&mut self.stored_review_comments);
+        // Reset the ID counter since all comments have been taken
+        self.next_review_comment_id = 0;
+        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
+        cx.notify();
+        comments
+    }
+
+    /// Sends the stored review comments, with the code each one refers to, to the agent.
+    pub(super) fn send_review_to_agent(
+        &mut self,
+        _: &SendReviewToAgent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let comments = self
+            .take_all_review_comments(cx)
+            .into_iter()
+            .flat_map(|(hunk_key, comments)| {
+                comments
+                    .into_iter()
+                    .map(move |comment| (hunk_key.file_path.clone(), comment))
+            })
+            .map(|(project_path, comment)| {
+                review_comment_content(&snapshot, &project_path, comment, cx)
+            })
+            .collect::<Vec<_>>();
+        if comments.is_empty() {
+            return;
+        }
+        window.dispatch_action(
+            zed_actions::agent::SendReviewComments { comments }.boxed_clone(),
+            cx,
+        );
+    }
+
+    /// Opens a review comment box for the rows of the newest selection.
+    pub(super) fn add_review_comment_action(
+        &mut self,
+        _: &AddReviewComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.show_diff_review_button {
+            return;
+        }
+        let display_snapshot = self.display_snapshot(cx);
+        let selection = self.selections.newest::<Point>(&display_snapshot).range();
+        let start = selection.start.to_display_point(&display_snapshot).row();
+        let end = selection.end.to_display_point(&display_snapshot).row();
+        self.show_diff_review_overlay(start..end, window, cx);
+    }
+
     /// Action handler for SubmitDiffReviewComment.
     pub(super) fn submit_diff_review_comment_action(
         &mut self,
@@ -2912,21 +2974,42 @@ impl Editor {
             .unwrap_or(end_point.row);
         Some((start_row, end_row))
     }
+}
 
-    /// Takes all stored comments from all hunks, clearing the storage.
-    /// Returns a Vec of (hunk_key, comments) pairs.
-    pub(super) fn take_all_review_comments(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Vec<(DiffHunkKey, Vec<StoredReviewComment>)> {
-        // Dismiss all overlays when taking comments (e.g., when sending to agent)
-        self.dismiss_all_diff_review_overlays(cx);
-        let comments = std::mem::take(&mut self.stored_review_comments);
-        // Reset the ID counter since all comments have been taken
-        self.next_review_comment_id = 0;
-        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
-        cx.notify();
-        comments
+/// Describes a stored review comment with its file, rows and code for the agent.
+fn review_comment_content(
+    snapshot: &MultiBufferSnapshot,
+    project_path: &util::rel_path::RelPath,
+    comment: StoredReviewComment,
+    cx: &App,
+) -> zed_actions::agent::ReviewCommentContent {
+    let start = comment.range.start.to_point(snapshot);
+    let end = comment.range.end.to_point(snapshot);
+    let code = snapshot
+        .text_for_range(
+            Point::new(start.row, 0)
+                ..Point::new(end.row, snapshot.line_len(MultiBufferRow(end.row))),
+        )
+        .collect();
+    let buffer_start = snapshot.point_to_buffer_point(start);
+    let start_row = buffer_start
+        .as_ref()
+        .map_or(start.row, |(_, point)| point.row);
+    let end_row = snapshot
+        .point_to_buffer_point(end)
+        .map_or(end.row, |(_, point)| point.row);
+    let file_path = buffer_start
+        .and_then(|(buffer, _)| {
+            let file = buffer.file()?.as_local()?;
+            Some(file.abs_path(cx).to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| project_path.as_unix_str().to_string());
+    zed_actions::agent::ReviewCommentContent {
+        file_path,
+        start_row,
+        end_row,
+        code,
+        comment: comment.comment,
     }
 }
 

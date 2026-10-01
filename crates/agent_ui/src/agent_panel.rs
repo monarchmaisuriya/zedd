@@ -27,7 +27,8 @@ use zed_actions::{
     agent::{
         AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
         ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
-        ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
+        ResolveConflictsWithAgent, ReviewBranchDiff, ReviewCommentContent, SelectAgent,
+        SendReviewComments,
     },
     assistant::{
         FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
@@ -357,6 +358,29 @@ struct SerializedActiveThread {
     work_dirs: Option<SerializedPathList>,
 }
 
+/// Builds the prompt that asks the agent to review a branch diff for bugs and security issues.
+fn build_branch_review_prompt(base_ref: &str, diff_text: &str) -> Vec<acp::ContentBlock> {
+    let diff_uri = MentionUri::GitDiff {
+        base_ref: base_ref.to_string(),
+    }
+    .to_uri()
+    .to_string();
+    vec![
+        acp::ContentBlock::Text(acp::TextContent::new(format!(
+            "Review the changes on this branch against `{base_ref}` for bugs and security \
+             issues only. For each finding, give the file and line, what goes wrong and in \
+             which situation, and a suggested fix. Skip style, naming, formatting and \
+             refactoring suggestions. If you find no bugs or security issues, say so.\n\n"
+        ))),
+        acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+            acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
+                diff_text.to_string(),
+                diff_uri,
+            )),
+        )),
+    ]
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(
         |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
@@ -528,26 +552,8 @@ pub fn init(cx: &mut App) {
                         return;
                     };
 
-                    let mention_uri = MentionUri::GitDiff {
-                        base_ref: action.base_ref.to_string(),
-                    };
-                    let diff_uri = mention_uri.to_uri().to_string();
-
-                    let content_blocks = vec![
-                        acp::ContentBlock::Text(acp::TextContent::new(
-                            "Please review this branch diff carefully. Point out any issues, \
-                             potential bugs, or improvement opportunities you find.\n\n"
-                                .to_string(),
-                        )),
-                        acp::ContentBlock::Resource(acp::EmbeddedResource::new(
-                            acp::EmbeddedResourceResource::TextResourceContents(
-                                acp::TextResourceContents::new(
-                                    action.diff_text.to_string(),
-                                    diff_uri,
-                                ),
-                            ),
-                        )),
-                    ];
+                    let content_blocks =
+                        build_branch_review_prompt(&action.base_ref, &action.diff_text);
 
                     workspace.focus_panel::<AgentPanel>(window, cx);
 
@@ -567,6 +573,9 @@ pub fn init(cx: &mut App) {
                             cx,
                         );
                     });
+                })
+                .register_action(|workspace, action: &SendReviewComments, window, cx| {
+                    send_review_comments(workspace, &action.comments, None, window, cx);
                 })
                 .register_action(
                     |workspace, action: &ResolveConflictsWithAgent, window, cx| {
@@ -833,6 +842,91 @@ fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp::C
     }
 
     blocks
+}
+
+/// Builds the prompt that asks the agent to address review comments on code.
+fn build_review_comments_prompt(comments: &[ReviewCommentContent]) -> Vec<acp::ContentBlock> {
+    let mut blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+        "Address these review comments on the code. Make the requested changes, then summarize \
+         what you changed for each comment.\n",
+    ))];
+    for comment in comments {
+        let uri = MentionUri::Selection {
+            abs_path: Some(PathBuf::from(&comment.file_path)),
+            line_range: comment.start_row..=comment.end_row,
+            column: None,
+        }
+        .to_uri()
+        .to_string();
+        blocks.push(acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+            acp::EmbeddedResourceResource::TextResourceContents(acp::TextResourceContents::new(
+                comment.code.clone(),
+                uri,
+            )),
+        )));
+        blocks.push(acp::ContentBlock::Text(acp::TextContent::new(format!(
+            "\n{}\n",
+            comment.comment
+        ))));
+    }
+    blocks
+}
+
+/// Sends review comments to `thread` when given, otherwise to the active thread or a new one.
+pub(crate) fn send_review_comments(
+    workspace: &mut Workspace,
+    comments: &[ReviewCommentContent],
+    thread: Option<&Entity<AcpThread>>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+        return;
+    };
+    let content = build_review_comments_prompt(comments);
+    let thread_view = match thread {
+        Some(thread) => panel.read(cx).thread_view_for(thread, cx),
+        None => panel.read(cx).active_thread_view(cx),
+    };
+    match (thread_view, thread) {
+        (Some(thread_view), _) => {
+            if thread.is_none() {
+                workspace.focus_panel::<AgentPanel>(window, cx);
+            }
+            thread_view.update(cx, |thread_view, cx| {
+                thread_view.send_or_queue_content(content, window, cx)
+            });
+        }
+        (None, Some(_)) => {
+            struct ReviewThreadClosedToast;
+            workspace.show_toast(
+                workspace::Toast::new(
+                    workspace::notifications::NotificationId::unique::<ReviewThreadClosedToast>(),
+                    "The thread that made these changes is no longer open",
+                ),
+                cx,
+            );
+        }
+        (None, None) => {
+            workspace.focus_panel::<AgentPanel>(window, cx);
+            panel.update(cx, |panel, cx| {
+                panel.external_thread(
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(AgentInitialContent::ContentBlock {
+                        blocks: content,
+                        auto_submit: true,
+                    }),
+                    true,
+                    AgentThreadSource::GitPanel,
+                    window,
+                    cx,
+                );
+            });
+        }
+    }
 }
 
 fn build_conflicted_files_resolution_prompt(
@@ -1910,19 +2004,13 @@ impl AgentPanel {
                 self.restorable_agent_selection(cx)
             }
         };
-        let initial_content = crate::draft_prompt_store::read(thread_id, cx).map(|blocks| {
-            AgentInitialContent::ContentBlock {
-                blocks,
-                auto_submit: false,
-            }
-        });
         let thread = self.create_agent_thread_with_server(
             agent,
             None,
             Some(thread_id),
             Some(metadata.folder_paths().clone()),
             metadata.title.clone(),
-            initial_content,
+            None,
             None,
             AgentThreadSource::AgentPanel,
             window,
@@ -4149,6 +4237,18 @@ impl AgentPanel {
             .collect()
     }
 
+    /// The open thread view showing `thread`, in any conversation the panel holds.
+    pub fn thread_view_for(
+        &self,
+        thread: &Entity<AcpThread>,
+        cx: &App,
+    ) -> Option<Entity<ThreadView>> {
+        let session_id = thread.read(cx).session_id();
+        self.conversation_views()
+            .into_iter()
+            .find_map(|conversation_view| conversation_view.read(cx).thread_view(session_id))
+    }
+
     pub fn active_thread_view(&self, cx: &App) -> Option<Entity<ThreadView>> {
         let server_view = self.active_conversation_view()?;
         server_view.read(cx).root_thread_view()
@@ -4536,27 +4636,13 @@ impl AgentPanel {
             return;
         }
 
-        // Not in memory. Build a fresh ConversationView. For drafts we
-        // also seed the message editor with any prompt text the user had
-        // typed before closing the window (persisted in the scoped kvp
-        // draft-prompt store).
-        let is_draft = ThreadMetadataStore::try_global(cx)
-            .and_then(|store| store.read(cx).entry(thread_id).map(|m| m.is_draft()))
-            .unwrap_or(false);
-        let initial_content = is_draft
-            .then(|| crate::draft_prompt_store::read(thread_id, cx))
-            .flatten()
-            .map(|blocks| AgentInitialContent::ContentBlock {
-                blocks,
-                auto_submit: false,
-            });
-
+        // Not in memory. Build a fresh ConversationView; it restores any unsent prompt.
         self.external_thread(
             Some(agent),
             Some(thread_id),
             work_dirs,
             title,
-            initial_content,
+            None,
             focus,
             source,
             window,
@@ -8854,6 +8940,119 @@ mod tests {
                 "restored thread should not be a draft"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_review_comments_go_to_the_active_thread(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+        let thread = panel.read_with(cx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+
+        let comments = vec![ReviewCommentContent {
+            file_path: "/project/file.txt".to_string(),
+            start_row: 0,
+            end_row: 0,
+            code: "let x = 1;".to_string(),
+            comment: "Rename this".to_string(),
+        }];
+        workspace.update_in(cx, |workspace, window, cx| {
+            send_review_comments(workspace, &comments, None, window, cx);
+        });
+        cx.run_until_parked();
+
+        let transcript = thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        assert!(
+            transcript.contains("Address these review comments")
+                && transcript.contains("Rename this"),
+            "the active thread should receive the review comments, got: {transcript}"
+        );
+    }
+
+    #[test]
+    fn test_review_comments_prompt_attaches_each_comment_to_its_code() {
+        let blocks = build_review_comments_prompt(&[ReviewCommentContent {
+            file_path: "/project/src/lib.rs".to_string(),
+            start_row: 4,
+            end_row: 6,
+            code: "fn x() {}".to_string(),
+            comment: "Rename this".to_string(),
+        }]);
+
+        let [
+            acp::ContentBlock::Text(_),
+            acp::ContentBlock::Resource(code),
+            acp::ContentBlock::Text(comment),
+        ] = blocks.as_slice()
+        else {
+            panic!("expected instructions, then the code and its comment, got {blocks:?}");
+        };
+        let acp::EmbeddedResourceResource::TextResourceContents(code) = &code.resource else {
+            panic!("expected the code as text contents");
+        };
+        assert_eq!(code.text, "fn x() {}");
+        assert_eq!(
+            code.uri,
+            MentionUri::Selection {
+                abs_path: Some(PathBuf::from("/project/src/lib.rs")),
+                line_range: 4..=6,
+                column: None,
+            }
+            .to_uri()
+            .to_string()
+        );
+        assert!(comment.text.contains("Rename this"));
+    }
+
+    #[test]
+    fn test_branch_review_prompt_asks_for_bugs_and_security_only() {
+        let blocks = build_branch_review_prompt("main", "diff --git a/x b/x");
+
+        let [
+            acp::ContentBlock::Text(instructions),
+            acp::ContentBlock::Resource(resource),
+        ] = blocks.as_slice()
+        else {
+            panic!("expected instructions followed by the embedded diff, got {blocks:?}");
+        };
+        assert!(instructions.text.contains("`main`"));
+        assert!(instructions.text.contains("bugs and security issues only"));
+        assert!(instructions.text.contains("Skip style"));
+        let acp::EmbeddedResourceResource::TextResourceContents(contents) = &resource.resource
+        else {
+            panic!("expected the diff as text contents");
+        };
+        assert_eq!(contents.text, "diff --git a/x b/x");
+        assert_eq!(
+            contents.uri,
+            MentionUri::GitDiff {
+                base_ref: "main".to_string()
+            }
+            .to_uri()
+            .to_string()
+        );
     }
 
     #[gpui::test]

@@ -707,6 +707,38 @@ fn visible_entries_as_strings(
 }
 
 #[gpui::test]
+async fn test_sidebar_is_painted_like_a_code_file(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    cx.update(|cx| AgentRegistryStore::init_test_global(cx, Vec::new()));
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    save_n_test_threads(1, &project, cx).await;
+    cx.update(|window, cx| {
+        let mut theme = cx.theme().as_ref().clone();
+        theme.styles.colors.editor_background = Hsla::from(gpui::rgb(0x1f1f1f));
+        theme.styles.colors.surface_background = Hsla::from(gpui::rgb(0x303030));
+        theme::GlobalTheme::update_theme(cx, Arc::new(theme));
+        window.refresh();
+    });
+    cx.run_until_parked();
+
+    let last_row = sidebar.read_with(cx, |sidebar, _| {
+        let last = sidebar.contents.entries.len() - 1;
+        sidebar
+            .list_state
+            .bounds_for_item(last)
+            .expect("rendered last row")
+    });
+    let below_rows = gpui::point(last_row.center().x, last_row.bottom() + px(40.));
+    assert_eq!(
+        sidebar_painted_background_at(below_rows, cx),
+        0x1f1f1fff,
+        "the thread list should be painted with the editor background"
+    );
+}
+
+#[gpui::test]
 async fn test_sidebar_action_hover_contrasts_with_row(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     cx.update(|cx| AgentRegistryStore::init_test_global(cx, Vec::new()));
@@ -715,8 +747,8 @@ async fn test_sidebar_action_hover_contrasts_with_row(cx: &mut TestAppContext) {
     let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
     save_n_test_threads(1, &project, cx).await;
 
-    for (query, surface_alpha) in [("my-project", 1.0), ("", 1.0), ("", 0.0), ("", 0.2)] {
-        set_sidebar_test_surface_alpha(surface_alpha, cx);
+    for (query, background_alpha) in [("my-project", 1.0), ("", 1.0), ("", 0.0), ("", 0.2)] {
+        set_sidebar_test_background_alpha(background_alpha, cx);
         type_in_search(&sidebar, query, cx);
         let row_bounds = sidebar.read_with(cx, |sidebar, _| {
             sidebar
@@ -779,7 +811,7 @@ async fn test_sidebar_action_hover_contrasts_with_row(cx: &mut TestAppContext) {
                 .map(|value| px(value.as_f32() / window.scale_factor()))
         });
         for surface_alpha in [1.0, 0.0, 0.2] {
-            set_sidebar_test_surface_alpha(surface_alpha, cx);
+            set_sidebar_test_background_alpha(surface_alpha, cx);
             assert_sidebar_action_hover(selector, row_bounds, cx);
         }
     }
@@ -15823,11 +15855,11 @@ async fn test_find_or_create_workspace_returns_the_created_remote_workspace(
     );
 }
 
-fn set_sidebar_test_surface_alpha(alpha: f32, cx: &mut VisualTestContext) {
+fn set_sidebar_test_background_alpha(alpha: f32, cx: &mut VisualTestContext) {
     cx.update(|window, cx| {
         let mut theme = cx.theme().as_ref().clone();
         theme.styles.colors.background = Hsla::from(gpui::rgb(0xdcdcdd));
-        theme.styles.colors.surface_background = Hsla::from(gpui::rgb(0xebebec)).alpha(alpha);
+        theme.styles.colors.editor_background = Hsla::from(gpui::rgb(0xebebec)).alpha(alpha);
         theme.styles.colors.element_background = Hsla::from(gpui::rgb(0xebebec));
         theme.styles.colors.ghost_element_hover = Hsla::from(gpui::rgb(0xdfdfe0));
         theme::GlobalTheme::update_theme(cx, Arc::new(theme));
@@ -15877,4 +15909,141 @@ fn sidebar_painted_background_at(position: Point<Pixels>, cx: &mut VisualTestCon
             .expect("solid background at pointer");
         u32::from(Rgba::from(color))
     })
+}
+
+/// Lays row `ix` out as an uncached view, so nothing fixes its height.
+fn natural_row_height(
+    sidebar: &Entity<Sidebar>,
+    ix: usize,
+    cx: &mut gpui::VisualTestContext,
+) -> Pixels {
+    let measured = std::rc::Rc::new(std::cell::Cell::new(None));
+    let row = cx.update(|_, cx| cx.new(|cx| SidebarRow::new(sidebar.clone(), ix, cx)));
+    cx.draw(
+        gpui::point(px(0.), px(0.)),
+        gpui::size(px(400.), px(2000.)),
+        |_, _| {
+            let measured = measured.clone();
+            gpui::div()
+                .w(px(400.))
+                .child(row)
+                .on_children_prepainted(move |bounds, _, _| {
+                    measured.set(bounds.first().map(|bounds| bounds.size.height));
+                })
+        },
+    );
+    measured.get().expect("the row should lay out")
+}
+
+async fn sidebar_with_rows(
+    cx: &mut TestAppContext,
+) -> (
+    Entity<Sidebar>,
+    Entity<MultiWorkspace>,
+    &mut gpui::VisualTestContext,
+) {
+    let (fs, project_a) = init_multi_project_test(&["/project-a", "/project-b"], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    add_test_project("/project-b", &fs, &multi_workspace, cx).await;
+    save_n_test_threads(3, &project_a, cx).await;
+    save_thread_metadata_with_main_paths(
+        "project-b-thread",
+        "Project B Thread",
+        PathList::new(&[PathBuf::from("/project-b")]),
+        PathList::new(&[PathBuf::from("/project-b")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 2, 0, 0, 0).unwrap(),
+        cx,
+    );
+    save_draft_metadata_with_main_paths(
+        None,
+        PathList::new(&[PathBuf::from("/project-b")]),
+        PathList::new(&[PathBuf::from("/project-b")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 3, 0, 0, 0).unwrap(),
+        cx,
+    );
+    cx.run_until_parked();
+    (sidebar, multi_workspace, cx)
+}
+
+#[gpui::test]
+async fn test_declared_row_heights_match_rendered_rows(cx: &mut TestAppContext) {
+    let (sidebar, _multi_workspace, cx) = sidebar_with_rows(cx).await;
+    let row_count = sidebar.read_with(cx, |sidebar, _| sidebar.contents.entries.len());
+    let mut heights = Vec::new();
+    for ix in 0..row_count {
+        let declared =
+            sidebar.update_in(cx, |sidebar, window, cx| sidebar.row_height(ix, window, cx));
+        let natural = natural_row_height(&sidebar, ix, cx);
+        assert_eq!(
+            declared, natural,
+            "row {ix} is laid out at its declared height without being rendered"
+        );
+        heights.push(declared);
+    }
+    let distinct = heights
+        .iter()
+        .map(|height| f32::from(*height).to_bits())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct >= 3,
+        "the rows should cover first and later headers and threads with and without a second \
+         line, got {heights:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_animating_row_renders_without_its_neighbors(cx: &mut TestAppContext) {
+    let (sidebar, _multi_workspace, cx) = sidebar_with_rows(cx).await;
+    let (running_ix, idle_ix) = sidebar.read_with(cx, |sidebar, _| {
+        let mut threads = sidebar
+            .contents
+            .entries
+            .iter()
+            .enumerate()
+            .filter(
+                |(_, entry)| matches!(entry, ListEntry::Thread(thread) if thread.draft.is_none()),
+            )
+            .map(|(ix, _)| ix);
+        (threads.next().unwrap(), threads.next().unwrap())
+    });
+    sidebar.update(cx, |sidebar, cx| {
+        if let ListEntry::Thread(thread) = &mut sidebar.contents.entries[running_ix] {
+            Arc::make_mut(thread).status = AgentThreadStatus::Running;
+        }
+        cx.notify();
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let render_counts = |cx: &mut gpui::VisualTestContext| {
+        sidebar.read_with(cx, |sidebar, cx| {
+            (
+                sidebar.row_views[running_ix].read(cx).render_count,
+                sidebar.row_views[idle_ix].read(cx).render_count,
+            )
+        })
+    };
+    let (running_before, idle_before) = render_counts(cx);
+    for _ in 0..3 {
+        cx.update(|window, cx| {
+            assert!(
+                window.simulate_next_frame(cx) > 0,
+                "the spinner asks for frames"
+            );
+            window.draw(cx).clear(cx);
+        });
+    }
+    let (running_after, idle_after) = render_counts(cx);
+
+    assert_eq!(
+        running_after,
+        running_before + 3,
+        "the spinner's row redraws each frame"
+    );
+    assert_eq!(
+        idle_after, idle_before,
+        "the other rows reuse their last frame"
+    );
 }

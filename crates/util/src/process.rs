@@ -120,6 +120,38 @@ impl Child {
         Ok(())
     }
 
+    /// Sends SIGTERM to the process group now, then SIGKILLs the group once the process exits or
+    /// `grace` resolves, whichever comes first. The process gets the grace period to clean up and
+    /// nothing left in its group outlives it. Dropping the returned future skips the SIGKILL.
+    #[cfg(not(windows))]
+    pub fn terminate_gracefully(
+        mut self,
+        grace: impl std::future::Future<Output = ()>,
+    ) -> impl std::future::Future<Output = ()> {
+        let process_group = self.process.id() as i32;
+        unsafe {
+            libc::killpg(process_group, libc::SIGTERM);
+        }
+        let exited = self.process.status();
+        async move {
+            futures::future::select(std::pin::pin!(exited), std::pin::pin!(grace)).await;
+            unsafe {
+                libc::killpg(process_group, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// Windows has no termination request a console process can handle, so this kills the
+    /// process tree immediately.
+    #[cfg(windows)]
+    pub fn terminate_gracefully(
+        mut self,
+        _grace: impl std::future::Future<Output = ()>,
+    ) -> impl std::future::Future<Output = ()> {
+        crate::ResultExt::log_err(self.kill());
+        async {}
+    }
+
     #[cfg(windows)]
     pub fn kill(&mut self) -> Result<()> {
         if let Some(job) = &self.job {
@@ -292,5 +324,78 @@ mod windows_tests {
             grandchild_pid,
             "grandchild should be terminated after dropping the child",
         );
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::Child;
+    use futures::FutureExt as _;
+    use smol::io::AsyncBufReadExt as _;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    /// A real process needs wall-clock time, and util cannot use GPUI's test timer.
+    #[allow(clippy::disallowed_methods)]
+    fn grace_period(duration: Duration) -> impl std::future::Future<Output = ()> {
+        smol::Timer::after(duration).map(|_| ())
+    }
+
+    /// Spawns `sh -c script` and waits until it prints `ready`, so its signal handling is in place.
+    async fn spawn_ready_shell(script: &str) -> Child {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script);
+        let mut child = Child::spawn(command, Stdio::null(), Stdio::piped(), Stdio::null())
+            .expect("sh should spawn");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let mut line = String::new();
+        smol::io::BufReader::new(stdout)
+            .read_line(&mut line)
+            .await
+            .expect("shell should print ready");
+        assert_eq!(line.trim(), "ready");
+        child
+    }
+
+    #[test]
+    fn test_terminate_gracefully_lets_process_handle_sigterm() {
+        smol::block_on(async {
+            let mut child =
+                spawn_ready_shell("trap 'exit 7' TERM; echo ready; while :; do sleep 0.05; done")
+                    .await;
+            let status = child.status();
+
+            child
+                .terminate_gracefully(grace_period(Duration::from_secs(10)))
+                .await;
+
+            let status = status.await.expect("exit status should be readable");
+            assert_eq!(
+                status.code(),
+                Some(7),
+                "the TERM handler should run before any SIGKILL, got {status:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_terminate_gracefully_kills_process_ignoring_sigterm() {
+        smol::block_on(async {
+            let mut child =
+                spawn_ready_shell("trap '' TERM; echo ready; while :; do sleep 0.05; done").await;
+            let status = child.status();
+
+            child
+                .terminate_gracefully(grace_period(Duration::from_millis(200)))
+                .await;
+
+            let status = status.await.expect("exit status should be readable");
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "a process ignoring SIGTERM should be killed after the grace period, got {status:?}"
+            );
+        });
     }
 }

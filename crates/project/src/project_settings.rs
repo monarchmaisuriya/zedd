@@ -65,6 +65,9 @@ pub struct ProjectSettings {
     /// Default timeout for context server requests in seconds.
     pub context_server_timeout: u64,
 
+    /// The command that checks the agent's work after its turns.
+    pub agent_verification: AgentVerificationSettings,
+
     /// Configuration for Diagnostics-related features.
     pub diagnostics: DiagnosticsSettings,
 
@@ -455,6 +458,15 @@ impl GoToDiagnosticSeverityFilter {
     }
 }
 
+/// A command that checks the agent's work after each agent turn that used tools.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentVerificationSettings {
+    /// The shell command to run in the project root; `None` turns verification off.
+    pub command: Option<String>,
+    pub timeout: Duration,
+    pub enabled_by_default: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct GitSettings {
     /// Whether or not git integration is enabled.
@@ -728,6 +740,16 @@ impl Settings for ProjectSettings {
                 .map(|(key, value)| (key, value.into()))
                 .collect(),
             context_server_timeout: project.context_server_timeout.unwrap_or(60),
+            agent_verification: {
+                let verification = project.agent_verification.clone().unwrap_or_default();
+                AgentVerificationSettings {
+                    command: verification
+                        .command
+                        .filter(|command| !command.trim().is_empty()),
+                    timeout: Duration::from_secs(verification.timeout_seconds.unwrap_or(600)),
+                    enabled_by_default: verification.enabled_by_default.unwrap_or(true),
+                }
+            },
             lsp: project
                 .lsp
                 .clone()

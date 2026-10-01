@@ -135,7 +135,7 @@ Local fork, no flags. Each part leaves the workspace compiling and tested; commi
 
 ### Part 3: UI
 - [x] "Fork from here" on user messages with the gating above (done when: an `agent_ui` test shows the action for native messages and not for external or subagent threads).
-- [ ] "Fork Thread" in the thread options menu and command palette (Decision 3) (done when: the action opens a new thread in the panel).
+- [x] "Fork Thread" in the thread options menu and command palette (Decision 3) (done when: the action opens a new thread in the panel). Verified 2026-10-01: `agent_panel.rs` menu item and `fork_active_thread` handler.
 - [ ] Open the fork in the panel (done when: manual run shows the new thread, its sidebar row, and the draft in the editor).
 
 ### Part 4: Verification

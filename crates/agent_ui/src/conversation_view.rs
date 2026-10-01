@@ -112,6 +112,7 @@ mod message_queue;
 mod thread_search_bar;
 mod thread_view;
 mod tool_run_summary;
+mod verify_gate;
 pub use message_queue::*;
 pub use thread_view::*;
 
@@ -644,6 +645,8 @@ pub struct ConversationView {
     /// causes mermaid diagrams to re-render).
     last_theme_id: Option<String>,
     draft_prompt_persist_task: Option<Task<()>>,
+    /// Tool calls whose plan document was already opened, so a re-sent request does not reopen it.
+    opened_plan_files: HashSet<acp_v1::ToolCallId>,
     /// Cache + worktree snapshot for resolving paths in markdown code spans.
     /// Shared with the child [`ThreadView`] when one is constructed.
     pub(crate) code_span_resolver: AgentCodeSpanResolver,
@@ -924,6 +927,7 @@ impl ConversationView {
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
             draft_prompt_persist_task: None,
+            opened_plan_files: HashSet::default(),
             code_span_resolver,
             request_elicitation_form_states: HashMap::default(),
             _subscriptions: subscriptions,
@@ -1211,6 +1215,16 @@ impl ConversationView {
                     Ok(thread) => {
                         this.clear_resolved_request_elicitations_for_connection(&connection, cx);
                         let root_session_id = thread.read(cx).session_id().clone();
+                        let initial_content = initial_content.or_else(|| {
+                            if !crate::draft_prompt_store::store_owns_draft(thread.read(cx)) {
+                                return None;
+                            }
+                            let blocks = crate::draft_prompt_store::read(this.thread_id, cx)?;
+                            Some(AgentInitialContent::ContentBlock {
+                                blocks,
+                                auto_submit: false,
+                            })
+                        });
 
                         let conversation = cx.new(|cx| {
                             let mut conversation = Conversation::default();
@@ -1697,7 +1711,8 @@ impl ConversationView {
             AcpThreadEvent::SubagentSpawned(subagent_session_id) => {
                 self.load_subagent_session(subagent_session_id.clone(), session_id, window, cx)
             }
-            AcpThreadEvent::ToolAuthorizationRequested(_) => {
+            AcpThreadEvent::ToolAuthorizationRequested(tool_call_id) => {
+                self.open_plan_file(&thread, tool_call_id, window, cx);
                 self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
             }
             AcpThreadEvent::ToolAuthorizationReceived(_) => {}
@@ -1756,6 +1771,13 @@ impl ConversationView {
                 } else {
                     false
                 };
+
+                if !sent_queued_message
+                    && *stop_reason == acp_v1::StopReason::EndTurn
+                    && let Some(active) = self.root_thread_view()
+                {
+                    active.update(cx, |active, cx| active.verify_turn(window, cx));
+                }
 
                 // Skip notifying when a queued message was just auto-sent: the agent
                 // is not actually idle and a notification here would fire just before the
@@ -1917,7 +1939,7 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::PromptUpdated => {
-                if !is_subagent && thread.read(cx).is_draft_thread() {
+                if !is_subagent && crate::draft_prompt_store::store_owns_draft(thread.read(cx)) {
                     self.schedule_draft_prompt_persist(cx);
                 }
                 cx.notify();
@@ -1935,7 +1957,7 @@ impl ConversationView {
             let persist = this.update(cx, |this, cx| {
                 let thread = this.root_thread(cx)?;
                 let thread = thread.read(cx);
-                if !thread.is_draft_thread() {
+                if !crate::draft_prompt_store::store_owns_draft(thread) {
                     return None;
                 }
                 let snapshot: Vec<acp_v1::ContentBlock> = thread
@@ -2881,6 +2903,41 @@ impl ConversationView {
         )
     }
 
+    /// Shows the plan document a plan-mode exit asks approval for, without taking focus.
+    fn open_plan_file(
+        &mut self,
+        thread: &Entity<AcpThread>,
+        tool_call_id: &acp_v1::ToolCallId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = thread
+            .read(cx)
+            .tool_call(tool_call_id)
+            .and_then(|(_, tool_call)| tool_call.plan_file_path())
+        else {
+            return;
+        };
+        if !self.opened_plan_files.insert(tool_call_id.clone()) {
+            return;
+        }
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .open_abs_path(
+                        path,
+                        workspace::OpenOptions {
+                            focus: Some(false),
+                            ..Default::default()
+                        },
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+            })
+            .log_err();
+    }
+
     fn notify_with_sound(
         &mut self,
         caption: impl Into<SharedString>,
@@ -3778,6 +3835,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use workspace::{Item, MultiWorkspace};
 
+    use crate::agent_connection_store::{AgentConnectionEntry, AgentConnectionStatus};
     use crate::agent_panel;
     use crate::completion_provider::AgentContextSource;
     use crate::test_support::register_test_sidebar;
@@ -4659,6 +4717,20 @@ pub(crate) mod tests {
 
         cx.run_until_parked();
 
+        // The store evicts the exited connection, and the fake's in-process agent lives only as
+        // long as its connection; hold it so the session close below still has a receiver.
+        let _connection = conversation_view.read_with(cx, |view, cx| {
+            let entry = view
+                .connection_store
+                .read(cx)
+                .entry(&Agent::Custom { id: "Test".into() })
+                .expect("connection should be cached");
+            match entry.read(cx) {
+                AgentConnectionEntry::Connected(state) => state.connection.clone(),
+                _ => panic!("connection should be connected"),
+            }
+        });
+
         server.simulate_server_exit();
         cx.run_until_parked();
 
@@ -4674,6 +4746,109 @@ pub(crate) mod tests {
             close_session_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "dropping the thread views after a thread exit should close the ACP session"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_acp_server_exit_evicts_cached_connection(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let server = FakeAcpAgentServer::new();
+        let (conversation_view, cx) = setup_conversation_view(server.clone(), cx).await;
+        let connection_store =
+            conversation_view.read_with(cx, |view, _cx| view.connection_store.clone());
+        let agent_key = Agent::Custom { id: "Test".into() };
+        let connection_status = |cx: &mut VisualTestContext| {
+            connection_store.read_with(cx, |store, cx| store.connection_status(&agent_key, cx))
+        };
+
+        cx.run_until_parked();
+        assert_eq!(connection_status(cx), AgentConnectionStatus::Connected);
+
+        server.simulate_server_exit();
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection_status(cx),
+            AgentConnectionStatus::Disconnected,
+            "an exited agent's connection must not be handed to new threads"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unsent_prompt_survives_reload_for_agent_without_draft_storage(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+
+        // Like external agents, the stub reloads sessions but does not save unsent prompts.
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+            acp_v1::ContentChunk::new("Response".into()),
+        )]);
+        let open_view = |resume_session_id, thread_id, cx: &mut VisualTestContext| {
+            let conversation_view = cx.update(|window, cx| {
+                cx.new(|cx| {
+                    ConversationView::new(
+                        Rc::new(StubAgentServer::new(connection.clone())),
+                        connection_store.clone(),
+                        Agent::Custom { id: "Test".into() },
+                        resume_session_id,
+                        thread_id,
+                        None,
+                        None,
+                        None,
+                        workspace.downgrade(),
+                        project.clone(),
+                        None,
+                        AgentThreadSource::AgentPanel,
+                        window,
+                        cx,
+                    )
+                })
+            });
+            cx.run_until_parked();
+            conversation_view
+        };
+
+        let first_view = open_view(None, None, cx);
+        let thread = active_thread(&first_view, cx).read_with(cx, |view, _| view.thread.clone());
+        thread
+            .update(cx, |thread, cx| thread.send_raw("first message", cx))
+            .await
+            .expect("prompt should succeed");
+        cx.run_until_parked();
+        assert!(!thread.read_with(cx, |thread, _| thread.is_draft_thread()));
+
+        let message_editor =
+            active_thread(&first_view, cx).read_with(cx, |view, _| view.message_editor.clone());
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("unsent follow-up", window, cx);
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(DRAFT_PROMPT_PERSIST_DEBOUNCE * 2);
+        cx.run_until_parked();
+
+        let thread_id = first_view.read_with(cx, |view, _| view.thread_id);
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        drop(first_view);
+        cx.run_until_parked();
+
+        let reloaded_view = open_view(Some(session_id), Some(thread_id), cx);
+        let restored_text = active_thread(&reloaded_view, cx)
+            .read_with(cx, |view, cx| view.message_editor.read(cx).text(cx));
+        assert_eq!(
+            restored_text, "unsent follow-up",
+            "an unsent prompt in a thread with a session should survive a reload"
         );
     }
 
@@ -5293,6 +5468,230 @@ pub(crate) mod tests {
             cx.windows()
                 .iter()
                 .any(|window| window.downcast::<AgentNotification>().is_some())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_plan_mode_exit_opens_plan_file_without_focus(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let plan_path = util::path!("/plans/plan.md");
+        let tool_call_id = acp_v1::ToolCallId::new("exit-plan");
+        let tool_call = acp_v1::ToolCall::new(tool_call_id.clone(), "Ready to code?")
+            .kind(acp_v1::ToolKind::SwitchMode)
+            .raw_input(json!({ "plan": "1. Do it", "planFilePath": plan_path }));
+        let connection =
+            StubAgentConnection::new().with_permission_requests(HashMap::from_iter([(
+                tool_call_id,
+                PermissionOptions::Flat(vec![acp_v1::PermissionOption::new(
+                    "1",
+                    "Allow",
+                    acp_v1::PermissionOptionKind::AllowOnce,
+                )]),
+            )]));
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(tool_call)]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let (project, workspace) = conversation_view.read_with(cx, |view, _| {
+            (view.project.clone(), view.workspace.upgrade().unwrap())
+        });
+        project
+            .read_with(cx, |project, _| project.fs().clone())
+            .as_fake()
+            .insert_tree(util::path!("/plans"), json!({ "plan.md": "1. Do it" }))
+            .await;
+
+        // Like the agent panel, the user's focus is in a dock, outside the pane the plan opens in.
+        let dock_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| {
+                workspace::dock::test::TestPanel::new(workspace::dock::DockPosition::Right, 100, cx)
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<workspace::dock::test::TestPanel>(window, cx);
+            panel
+        });
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Plan it", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let plan_editor = workspace.read_with(cx, |workspace, cx| {
+            workspace.items_of_type::<Editor>(cx).find(|editor| {
+                editor
+                    .read(cx)
+                    .buffer()
+                    .read(cx)
+                    .as_singleton()
+                    .is_some_and(|buffer| {
+                        buffer.read(cx).file().is_some_and(|file| {
+                            file.full_path(cx).ends_with(Path::new("plans/plan.md"))
+                        })
+                    })
+            })
+        });
+        let plan_editor = plan_editor.expect("the plan document should open in the workspace");
+        let plan_has_focus =
+            cx.update(|window, cx| plan_editor.focus_handle(cx).contains_focused(window, cx));
+        assert!(
+            !plan_has_focus,
+            "opening the plan must not take focus from the thread"
+        );
+        let dock_has_focus = cx.update(|window, cx| {
+            dock_panel
+                .read(cx)
+                .focus_handle
+                .contains_focused(window, cx)
+        });
+        assert!(dock_has_focus, "focus should stay where the user was");
+    }
+
+    #[gpui::test]
+    async fn test_failed_verification_asks_the_agent_to_fix_once(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            use gpui::UpdateGlobal as _;
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.agent_verification =
+                        Some(settings::AgentVerificationSettingsContent {
+                            command: Some("echo checking; exit 3".to_string()),
+                            ..Default::default()
+                        });
+                });
+            });
+        });
+
+        // The command runs in a real shell, so the project root must exist on disk.
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(&root_path, json!({ "a.txt": "" })).await;
+        let project = Project::test(fs, [root_path.as_path()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::ToolCall(
+            acp_v1::ToolCall::new("edit-1", "Edit a.txt")
+                .kind(acp_v1::ToolKind::Edit)
+                .status(acp_v1::ToolCallStatus::Completed),
+        )]);
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(StubAgentServer::new(connection.clone())),
+                    connection_store,
+                    Agent::Custom { id: "Test".into() },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project.clone(),
+                    None,
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Change a.txt", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+
+        let user_messages = |cx: &mut VisualTestContext| {
+            thread.read_with(cx, |thread, cx| {
+                thread
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        AgentThreadEntry::UserMessage(message) => {
+                            Some(message.content.to_markdown(cx))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        for _ in 0..500 {
+            cx.run_until_parked();
+            if user_messages(cx).len() > 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let messages = user_messages(cx);
+        assert_eq!(
+            messages.len(),
+            2,
+            "expected one fix request, got {messages:?}"
+        );
+        assert!(
+            messages[1].contains("failed with exit code 3") && messages[1].contains("checking"),
+            "the fix request should quote the failure, got {:?}",
+            messages[1]
+        );
+        let verify_failed = thread.read_with(cx, |thread, _| {
+            thread.entries().iter().any(|entry| {
+                matches!(entry, AgentThreadEntry::ToolCall(call)
+                    if call.id.0.starts_with("verify-")
+                        && matches!(call.status(), acp_thread::ToolCallStatus::Failed))
+            })
+        });
+        assert!(
+            verify_failed,
+            "the check should show in the thread as a failed tool call"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_background_tasks_show_in_the_activity_bar(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(StubAgentConnection::new()), cx).await;
+        let thread_view = active_thread(&conversation_view, cx);
+        let has_activity_bar = |cx: &mut VisualTestContext| {
+            thread_view.update_in(cx, |view, window, cx| {
+                view.render_activity_bar(window, cx).is_some()
+            })
+        };
+        assert!(!has_activity_bar(cx), "nothing to show yet");
+
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        thread.update(cx, |thread, cx| {
+            thread
+                .apply_background_task_update(
+                    acp_thread::BackgroundTaskUpdate::Spawned(acp_thread::BackgroundTask {
+                        id: "task-1".into(),
+                        name: "npm run dev".into(),
+                        description: "Dev server".into(),
+                        state: acp_thread::BackgroundTaskState::Running,
+                        summary: None,
+                        tool_call_id: None,
+                        can_stop: true,
+                    }),
+                    cx,
+                )
+                .unwrap();
+        });
+        assert!(
+            has_activity_bar(cx),
+            "a background task shows in the activity bar"
         );
     }
 

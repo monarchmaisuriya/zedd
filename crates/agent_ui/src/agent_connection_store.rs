@@ -166,7 +166,8 @@ impl AgentConnectionStore {
             let entry = entry.downgrade();
             async move |this, cx| match connect_task.await {
                 Ok(connected_state) => {
-                    this.update(cx, move |this, cx| {
+                    let closed = connected_state.connection.closed();
+                    this.update(cx, |this, cx| {
                         if this.entries.get(&key) != entry.upgrade().as_ref() {
                             return;
                         }
@@ -182,6 +183,18 @@ impl AgentConnectionStore {
                         cx.notify();
                     })
                     .ok();
+
+                    // A closed connection cannot serve new sessions, so the next request starts a fresh one.
+                    if let Some(closed) = closed {
+                        closed.await;
+                        this.update(cx, |this, cx| {
+                            if this.entries.get(&key) == entry.upgrade().as_ref() {
+                                this.entries.remove(&key);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }
                 }
                 Err(error) => {
                     this.update(cx, move |this, cx| {

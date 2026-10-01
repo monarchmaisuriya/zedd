@@ -11,6 +11,7 @@ use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
 use agent_settings::UserAgentsMd;
 
+use crate::hooks::{self, HooksOutcome};
 use crate::sandboxing::{
     SandboxRequest, ThreadSandbox, ThreadSandboxGrants, sandbox_git_dirs,
     sandbox_worktree_writable_paths, sandboxing_available_for_project,
@@ -18,8 +19,8 @@ use crate::sandboxing::{
 };
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{
-    AgentProfileId, AgentProfileSettings, AgentSettings, AutoCompactThreshold, COMPACTION_PROMPT,
-    SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT, builtin_profiles,
+    AgentHook, AgentProfileId, AgentProfileSettings, AgentSettings, AutoCompactThreshold,
+    COMPACTION_PROMPT, SUMMARIZE_THREAD_DETAILED_PROMPT, SUMMARIZE_THREAD_PROMPT, builtin_profiles,
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Local, Utc};
@@ -2809,15 +2810,88 @@ impl Thread {
         let message_ix = self.messages.len().saturating_sub(1);
         self.clear_summary();
         let tools = self.enabled_tools(cx);
+        let hook_settings = AgentSettings::get_global(cx).hooks.clone();
+        let hook_cwd = self.hook_cwd(cx);
+        let prompt = (!hook_settings.user_prompt_submit.is_empty())
+            .then(|| self.prompt_text(message_ix))
+            .flatten();
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
         let task = cx.spawn({
             let event_stream = event_stream.clone();
             async move |this, cx| {
                 log::debug!("Starting agent turn execution");
 
-                let turn_result =
+                if let Some(prompt) = prompt {
+                    let event = serde_json::json!({
+                        "hook_event_name": "user_prompt_submit",
+                        "prompt": prompt,
+                        "cwd": hook_cwd,
+                    });
+                    match hooks::run_hooks(
+                        hook_settings.user_prompt_submit,
+                        event,
+                        hook_cwd.clone(),
+                        cx.background_executor().clone(),
+                    )
+                    .await
+                    {
+                        HooksOutcome::Failed(reason) => {
+                            event_stream.send_error(anyhow!("Prompt blocked by {reason}"));
+                            _ = this.update(cx, |this, _| {
+                                this.messages.truncate(message_ix);
+                                this.running_turn.take();
+                            });
+                            return;
+                        }
+                        HooksOutcome::Passed(context) if !context.trim().is_empty() => {
+                            _ = this.update(cx, |this, _| {
+                                this.add_prompt_hook_context(message_ix, context)
+                            });
+                        }
+                        HooksOutcome::Passed(_) => {}
+                    }
+                }
+
+                let mut turn_result =
                     Self::run_turn_internal(&this, &event_stream, cancellation_rx.clone(), cx)
                         .await;
+
+                // A failing stop hook gets one more turn per user message, so it cannot loop.
+                if turn_result.is_ok()
+                    && !hook_settings.stop.is_empty()
+                    && !*cancellation_rx.borrow()
+                    && let HooksOutcome::Failed(reason) = hooks::run_hooks(
+                        hook_settings.stop,
+                        serde_json::json!({ "hook_event_name": "stop", "cwd": hook_cwd }),
+                        hook_cwd.clone(),
+                        cx.background_executor().clone(),
+                    )
+                    .await
+                {
+                    let feedback = UserMessage {
+                        id: ClientUserMessageId::new(),
+                        content: Arc::from([UserMessageContent::Text(format!(
+                            "A stop hook reported a problem. Address it before finishing.\n\n\
+                             {reason}"
+                        ))]),
+                    };
+                    let pushed = this.update(cx, |this, cx| {
+                        this.flush_pending_message(cx);
+                        this.messages
+                            .push(Arc::new(Message::User(feedback.clone())));
+                        cx.notify();
+                    });
+                    if pushed.is_ok() {
+                        event_stream.send_user_message(&feedback);
+                        turn_result = Self::run_turn_internal(
+                            &this,
+                            &event_stream,
+                            cancellation_rx.clone(),
+                            cx,
+                        )
+                        .await;
+                    }
+                }
 
                 // Check if we were cancelled - if so, cancel() already took running_turn
                 // and we shouldn't touch it (it might be a NEW turn now)
@@ -3761,9 +3835,26 @@ impl Thread {
             acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
         );
         let supports_images = self.model().is_some_and(|model| model.supports_images());
-        let tool_result = tool.run(tool_input, tool_event_stream, cx);
+        let hook_settings = &AgentSettings::get_global(cx).hooks;
+        let pre_tool_hooks = hooks::hooks_for_tool(&hook_settings.pre_tool_use, &tool_name);
+        let post_tool_hooks = hooks::hooks_for_tool(&hook_settings.post_tool_use, &tool_name);
+        let hook_cwd = self.hook_cwd(cx);
+        let tool_result = if pre_tool_hooks.is_empty() {
+            tool.run(tool_input, tool_event_stream, cx)
+        } else {
+            Self::run_tool_after_hooks(
+                tool,
+                tool_name.clone(),
+                tool_input,
+                tool_event_stream,
+                pre_tool_hooks,
+                hook_cwd.clone(),
+                cx,
+            )
+        };
+        let executor = cx.background_executor().clone();
         cx.foreground_executor().spawn(async move {
-            let (is_error, output) = match tool_result.await {
+            let (is_error, mut output) = match tool_result.await {
                 Ok(mut output) => {
                     let contains_image = output
                         .llm_output
@@ -3806,6 +3897,37 @@ impl Thread {
                 Err(output) => (true, output),
             };
 
+            if !post_tool_hooks.is_empty() {
+                let tool_output: String = output
+                    .llm_output
+                    .iter()
+                    .filter_map(|part| match part {
+                        LanguageModelToolResultContent::Text(text) => Some(text.as_ref()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .chars()
+                    .take(hooks::HOOK_TOOL_OUTPUT_CHARS)
+                    .collect();
+                let event = serde_json::json!({
+                    "hook_event_name": "post_tool_use",
+                    "tool_name": tool_name.as_ref(),
+                    "tool_output": tool_output,
+                    "is_error": is_error,
+                    "cwd": hook_cwd,
+                });
+                if let HooksOutcome::Failed(reason) =
+                    hooks::run_hooks(post_tool_hooks, event, hook_cwd, executor).await
+                {
+                    output
+                        .llm_output
+                        .push(LanguageModelToolResultContent::Text(Arc::from(format!(
+                            "Hook feedback: {reason}"
+                        ))));
+                }
+            }
+
             (
                 owning_message_ix,
                 LanguageModelToolResult {
@@ -3817,6 +3939,77 @@ impl Thread {
                 },
             )
         })
+    }
+
+    /// Runs `tool` once its pre-tool hooks pass. The hooks need the whole input, so the tool gets
+    /// it at once instead of streamed.
+    fn run_tool_after_hooks(
+        tool: Arc<dyn AnyAgentTool>,
+        tool_name: Arc<str>,
+        tool_input: ToolInput<serde_json::Value>,
+        event_stream: ToolCallEventStream,
+        pre_tool_hooks: Vec<AgentHook>,
+        cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<AgentToolOutput, AgentToolOutput>> {
+        cx.spawn(async move |_this, cx| {
+            let input = tool_input.recv().await.map_err(AgentToolOutput::from)?;
+            let event = serde_json::json!({
+                "hook_event_name": "pre_tool_use",
+                "tool_name": tool_name.as_ref(),
+                "tool_input": input,
+                "cwd": cwd,
+            });
+            if let HooksOutcome::Failed(reason) =
+                hooks::run_hooks(pre_tool_hooks, event, cwd, cx.background_executor().clone()).await
+            {
+                return Err(anyhow!("Blocked by {reason}").into());
+            }
+            cx.update(|cx| tool.run(ToolInput::ready(input), event_stream, cx))
+                .await
+        })
+    }
+
+    /// Hooks run in the project's first worktree, like the agent's terminal.
+    fn hook_cwd(&self, cx: &App) -> Option<PathBuf> {
+        self.project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+    }
+
+    /// The text the user sent in the message that starts a turn.
+    fn prompt_text(&self, message_ix: usize) -> Option<String> {
+        let Some(Message::User(message)) = self.messages.get(message_ix).map(AsRef::as_ref) else {
+            return None;
+        };
+        Some(
+            message
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    UserMessageContent::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// Adds what a prompt hook printed to the prompt it ran for.
+    fn add_prompt_hook_context(&mut self, message_ix: usize, context: String) {
+        let Some(Message::User(message)) = self.messages.get(message_ix).map(AsRef::as_ref) else {
+            return;
+        };
+        let mut content = message.content.to_vec();
+        content.push(UserMessageContent::Text(format!(
+            "\n\nContext from a prompt hook:\n{context}"
+        )));
+        self.messages[message_ix] = Arc::new(Message::User(UserMessage {
+            id: message.id.clone(),
+            content: content.into(),
+        }));
     }
 
     fn handle_tool_use_json_parse_error_event(

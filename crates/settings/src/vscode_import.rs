@@ -546,6 +546,7 @@ impl VsCodeSettings {
             load_direnv: None,
             git_hosting_providers: None,
             disable_ai: None,
+            agent_verification: None,
         }
     }
 

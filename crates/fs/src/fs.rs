@@ -37,7 +37,6 @@ use git::repository::{GitRepository, RealGitRepository};
 use is_executable::IsExecutable;
 use rope::Rope;
 use serde::{Deserialize, Serialize};
-use smol::io::AsyncWriteExt;
 #[cfg(feature = "test-support")]
 use std::path::Component;
 use std::{
@@ -732,6 +731,93 @@ fn read_dir_entries(path: PathBuf) -> Result<impl Send + Iterator<Item = Result<
     }))
 }
 
+/// Replaces the contents of the file at `path` so that a crash or a full disk during the write
+/// leaves the old contents intact: the new contents go to a temporary file beside the original,
+/// which is synced and then renamed over it. A symlinked path keeps its link and replaces the
+/// file it points to.
+///
+/// Writes in place instead when a rename would change what the path is or what it carries: a new
+/// file, a non-regular file, a file with other hard links, a directory that does not allow new
+/// files, or an owner or (on macOS) ACLs and extended attributes that cannot be copied.
+#[cfg(unix)]
+fn replace_file_contents(path: &Path, content: &[u8]) -> Result<()> {
+    let write_in_place = |path: &Path| {
+        std::fs::write(path, content).with_context(|| format!("Failed to write file at {path:?}"))
+    };
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return write_in_place(path),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to resolve file at {path:?}"));
+        }
+    };
+    let metadata = std::fs::metadata(&target)
+        .with_context(|| format!("Failed to read metadata of {target:?}"))?;
+    let Some(directory) = target
+        .parent()
+        .filter(|_| metadata.is_file() && metadata.nlink() == 1)
+    else {
+        return write_in_place(&target);
+    };
+    // Opening for writing keeps the original's permission check: a read-only file stays unsaved.
+    let original = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .with_context(|| format!("Failed to open file at {target:?}"))?;
+    let mut temporary = match tempfile::NamedTempFile::new_in(directory) {
+        Ok(temporary) => temporary,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return write_in_place(&target);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to create a temporary file in {directory:?}"));
+        }
+    };
+    let temporary_metadata = temporary.as_file().metadata()?;
+    if (temporary_metadata.uid(), temporary_metadata.gid()) != (metadata.uid(), metadata.gid())
+        && std::os::unix::fs::fchown(
+            temporary.as_file(),
+            Some(metadata.uid()),
+            Some(metadata.gid()),
+        )
+        .is_err()
+    {
+        return write_in_place(&target);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let copied = unsafe {
+            libc::fcopyfile(
+                original.as_raw_fd(),
+                temporary.as_file().as_raw_fd(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_ACL | libc::COPYFILE_XATTR,
+            )
+        };
+        if copied != 0 {
+            return write_in_place(&target);
+        }
+    }
+    drop(original);
+    temporary
+        .as_file()
+        .set_permissions(metadata.permissions())?;
+    temporary.write_all(content)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(&target)
+        .map_err(|error| error.error)
+        .with_context(|| format!("Failed to replace file at {target:?}"))?;
+    Ok(())
+}
+
+/// Windows writes in place, as before.
+#[cfg(not(unix))]
+fn replace_file_contents(path: &Path, content: &[u8]) -> Result<()> {
+    std::fs::write(path, content).with_context(|| format!("Failed to write file at {path:?}"))
+}
+
 #[async_trait::async_trait]
 impl Fs for RealFs {
     async fn create_dir(&self, path: &Path) -> Result<()> {
@@ -1017,21 +1103,19 @@ impl Fs for RealFs {
     }
 
     async fn save(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()> {
-        let buffer_size = text.summary().len.min(10 * 1024);
         if let Some(path) = path.parent() {
             self.create_dir(path)
                 .await
                 .with_context(|| format!("Failed to create directory at {:?}", path))?;
         }
-        let file = smol::fs::File::create(path)
-            .await
-            .with_context(|| format!("Failed to create file at {:?}", path))?;
-        let mut writer = smol::io::BufWriter::with_capacity(buffer_size, file);
+        let mut content = Vec::with_capacity(text.summary().len);
         for chunk in text::chunks_with_line_ending(text, line_ending) {
-            writer.write_all(chunk.as_bytes()).await?;
+            content.extend_from_slice(chunk.as_bytes());
         }
-        writer.flush().await?;
-        Ok(())
+        let path = path.to_owned();
+        self.executor
+            .spawn(async move { replace_file_contents(&path, &content) })
+            .await
     }
 
     async fn write(&self, path: &Path, content: &[u8]) -> Result<()> {
@@ -1041,12 +1125,9 @@ impl Fs for RealFs {
                 .with_context(|| format!("Failed to create directory at {:?}", path))?;
         }
         let path = path.to_owned();
-        let contents = content.to_owned();
+        let content = content.to_owned();
         self.executor
-            .spawn(async move {
-                std::fs::write(path, contents)?;
-                Ok(())
-            })
+            .spawn(async move { replace_file_contents(&path, &content) })
             .await
     }
 

@@ -253,6 +253,33 @@ pub struct AgentSettings {
     pub show_merge_conflict_indicator: bool,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
+    pub hooks: AgentHooks,
+}
+
+/// Commands the native agent runs at points in its loop, from user settings only.
+#[derive(Clone, Debug, Default)]
+pub struct AgentHooks {
+    pub pre_tool_use: Vec<AgentHook>,
+    pub post_tool_use: Vec<AgentHook>,
+    pub user_prompt_submit: Vec<AgentHook>,
+    pub stop: Vec<AgentHook>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentHook {
+    /// `None` runs the hook for every tool. An invalid matcher also becomes `None`, so a typo
+    /// can never silently switch a guard off.
+    pub matcher: Option<CompiledRegex>,
+    pub command: String,
+    pub timeout: std::time::Duration,
+}
+
+impl AgentHook {
+    pub fn applies_to(&self, tool_name: &str) -> bool {
+        self.matcher
+            .as_ref()
+            .is_none_or(|matcher| matcher.regex.is_match(tool_name))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -852,7 +879,40 @@ impl Settings for AgentSettings {
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
+            hooks: compile_agent_hooks(agent.hooks),
         }
+    }
+}
+
+fn compile_agent_hooks(content: Option<settings::AgentHooksContent>) -> AgentHooks {
+    let Some(content) = content else {
+        return AgentHooks::default();
+    };
+    let compile = |hooks: Option<Vec<settings::AgentHookContent>>| {
+        hooks
+            .unwrap_or_default()
+            .into_iter()
+            .map(|hook| AgentHook {
+                matcher: hook.matcher.as_deref().and_then(|pattern| {
+                    CompiledRegex::try_new(pattern, true)
+                        .inspect_err(|error| {
+                            log::error!(
+                                "agent hook matcher {pattern:?} is not a valid regex, so the hook \
+                                 runs for every tool: {error}"
+                            )
+                        })
+                        .ok()
+                }),
+                command: hook.command,
+                timeout: std::time::Duration::from_secs(hook.timeout_seconds.unwrap_or(60)),
+            })
+            .collect()
+    };
+    AgentHooks {
+        pre_tool_use: compile(content.pre_tool_use),
+        post_tool_use: compile(content.post_tool_use),
+        user_prompt_submit: compile(content.user_prompt_submit),
+        stop: compile(content.stop),
     }
 }
 

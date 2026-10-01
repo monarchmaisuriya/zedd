@@ -246,10 +246,65 @@ impl ThreadItem {
         self.base_bg = Some(color);
         self
     }
+
+    /// The row's height. It is fixed, so a list can lay the row out without rendering it.
+    pub fn height(&self, window: &Window, cx: &App) -> Pixels {
+        let rem_size = window.rem_size();
+        let metadata_line = if self.has_metadata() {
+            metadata_line_height(window, cx)
+        } else {
+            px(0.)
+        };
+        TITLE_ROW_HEIGHT.to_pixels(rem_size)
+            + ROW_PADDING.to_pixels(rem_size) * 2.
+            + ROW_BORDER * 2.
+            + metadata_line
+    }
+
+    /// Whether the row shows its second line: project, worktree, diff stats or timestamp.
+    fn has_metadata(&self) -> bool {
+        self.project_name.is_some()
+            || self.project_paths_label().is_some()
+            || self.worktrees.iter().any(shows_worktree)
+            || self.added.is_some()
+            || self.removed.is_some()
+            || !self.timestamp.is_empty()
+    }
+
+    fn project_paths_label(&self) -> Option<String> {
+        let paths = self.project_paths.as_ref()?;
+        let label = paths
+            .iter()
+            .filter_map(|path| path.file_name())
+            .filter_map(|name| name.to_str())
+            .join(", ");
+        (!label.is_empty()).then_some(label)
+    }
+}
+
+const TITLE_ROW_HEIGHT: Rems = rems(1.5);
+const ROW_PADDING: Rems = rems(0.25);
+const ROW_BORDER: Pixels = px(1.);
+
+/// One line of the small label text the second line uses.
+fn metadata_line_height(window: &Window, cx: &App) -> Pixels {
+    let mut text_style = window.text_style();
+    text_style.font_size = TextSize::Small.rems(cx).into();
+    text_style.line_height_in_pixels(window.rem_size())
+}
+
+/// Only a linked worktree with a name or branch is worth a chip.
+fn shows_worktree(worktree: &ThreadItemWorktreeInfo) -> bool {
+    worktree.kind == WorktreeKind::Linked
+        && (worktree.worktree_name.is_some() || worktree.branch_name.is_some())
 }
 
 impl RenderOnce for ThreadItem {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let height = self.height(window, cx);
+        let has_metadata = self.has_metadata();
+        let metadata_line_height = metadata_line_height(window, cx);
+        let project_paths = self.project_paths_label();
         let color = cx.theme().colors();
         let raw_bg = self.base_bg.unwrap_or(color.surface_background);
         // The fade gradient paints a solid color over the title to blend it into
@@ -381,20 +436,6 @@ impl RenderOnce for ThreadItem {
         let added_count = self.added.unwrap_or(0);
         let removed_count = self.removed.unwrap_or(0);
 
-        let project_paths = self.project_paths.as_ref().and_then(|paths| {
-            let paths_str = paths
-                .as_ref()
-                .iter()
-                .filter_map(|p| p.file_name())
-                .filter_map(|name| name.to_str())
-                .join(", ");
-            if paths_str.is_empty() {
-                None
-            } else {
-                Some(paths_str)
-            }
-        });
-
         let has_project_name = self.project_name.is_some();
         let has_project_paths = project_paths.is_some();
         let has_timestamp = !self.timestamp.is_empty();
@@ -405,20 +446,10 @@ impl RenderOnce for ThreadItem {
             AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
         );
 
-        let linked_worktrees: Vec<ThreadItemWorktreeInfo> = self
-            .worktrees
-            .into_iter()
-            .filter(|wt| wt.kind == WorktreeKind::Linked)
-            .filter(|wt| wt.worktree_name.is_some() || wt.branch_name.is_some())
-            .collect();
+        let linked_worktrees: Vec<ThreadItemWorktreeInfo> =
+            self.worktrees.into_iter().filter(shows_worktree).collect();
 
         let has_worktree = !linked_worktrees.is_empty();
-
-        let has_metadata = has_project_name
-            || has_project_paths
-            || has_worktree
-            || has_diff_stats
-            || has_timestamp;
 
         v_flex()
             .id(self.id.clone())
@@ -428,7 +459,8 @@ impl RenderOnce for ThreadItem {
             .flex_shrink_0()
             .overflow_hidden()
             .w_full()
-            .py_1()
+            .h(height)
+            .py(ROW_PADDING)
             .px_1p5()
             .when(self.selected, |s| s.bg(color.ghost_element_selected))
             .border_1()
@@ -443,7 +475,7 @@ impl RenderOnce for ThreadItem {
                 h_flex()
                     .min_w_0()
                     .w_full()
-                    .h_6()
+                    .h(TITLE_ROW_HEIGHT)
                     .gap_2()
                     .justify_between()
                     .child(
@@ -487,6 +519,7 @@ impl RenderOnce for ThreadItem {
             .when(has_metadata, |this| {
                 this.child(
                     h_flex()
+                        .h(metadata_line_height)
                         .gap_1p5()
                         .child(icon_container()) // Icon Spacing
                         .when(self.archived, |this| {
